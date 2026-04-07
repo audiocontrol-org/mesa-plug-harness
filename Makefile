@@ -1,57 +1,27 @@
-CC        = gcc
 CXX       = g++
-# MUSASHI_CNF path is relative to musashi/ source directory
-CFLAGS    = -Wall -Wextra -g -I. -DMUSASHI_CNF='"../m68kconf.h"'
-CXXFLAGS  = -Wall -Wextra -g -std=c++17 -I.
-LFLAGS    = -lm -lstdc++
+CC        = gcc
+CXXFLAGS  = -Wall -Wextra -g -std=c++17 -Isrc
+CFLAGS    = -Wall -Wextra -g -Isrc
 
-MUSASHI   = musashi
-TARGET    = mesa-plug-harness
+TARGET    = s3k-client
 
-# Musashi source files
-MUSASHI_SRC = $(MUSASHI)/m68kcpu.c $(MUSASHI)/m68kdasm.c $(MUSASHI)/softfloat/softfloat.c
-MUSASHI_GEN = $(MUSASHI)/m68kops.c
-MUSASHI_HDR = $(MUSASHI)/m68kops.h
+# Client sources
+SRC       = src/main.cpp src/s3k_client.cpp src/scsi_midi.cpp \
+            src/akai_sysex.cpp src/scsi_bridge.cpp
+OBJECTS   = $(SRC:src/%.cpp=build/%.o)
 
-# All objects
-OBJECTS = main.o scsi_bridge.o m68kcpu.o m68kdasm.o m68kops.o softfloat.o
-
-PLUG_BIN  = ../sheepshaver-data/mesa_scsi_plug.bin
-
-.PHONY: all clean run
+.PHONY: all clean
 
 all: $(TARGET)
 
+build:
+	mkdir -p build
+
 $(TARGET): $(OBJECTS)
-	$(CXX) $(LFLAGS) -o $@ $^
+	$(CXX) $(CXXFLAGS) -o $@ $^
 
-main.o: main.c m68kconf.h scsi_bridge.h $(MUSASHI_HDR)
-	$(CC) $(CFLAGS) -c -o $@ main.c
-
-scsi_bridge.o: scsi_bridge.cpp scsi_bridge.h
+build/%.o: src/%.cpp | build
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
-m68kcpu.o: $(MUSASHI)/m68kcpu.c $(MUSASHI_HDR) m68kconf.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-m68kdasm.o: $(MUSASHI)/m68kdasm.c m68kconf.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-m68kops.o: $(MUSASHI_GEN) m68kconf.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-softfloat.o: $(MUSASHI)/softfloat/softfloat.c
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-# Generate Musashi opcode tables
-$(MUSASHI_GEN) $(MUSASHI_HDR): $(MUSASHI)/m68kmake
-	cd $(MUSASHI) && ./m68kmake
-
-$(MUSASHI)/m68kmake: $(MUSASHI)/m68kmake.c
-	$(CC) -o $@ $<
-
 clean:
-	rm -f $(TARGET) $(OBJECTS) $(MUSASHI)/m68kmake $(MUSASHI_GEN) $(MUSASHI_HDR)
-
-run: $(TARGET)
-	./$(TARGET) $(PLUG_BIN)
+	rm -rf build $(TARGET)

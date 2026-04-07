@@ -7,3 +7,4 @@ plug-harness
 musashi/m68kmake
 musashi/m68kops.c
 musashi/m68kops.h
+s3k-client
