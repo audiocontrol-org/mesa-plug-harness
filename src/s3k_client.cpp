@@ -99,18 +99,6 @@ int s3k_fetch_sample_header(S3kClient *c, int sample_num, S3kSampleHeader *hdr) 
     size_t rx_len = sizeof(rx);
 
     int status = s3k_exchange(c, OP_RSDATA, req_data, 2, rx, &rx_len);
-    fprintf(stderr, "s3k: RSDATA: status=%d rx_len=%zu\n", status, rx_len);
-    if (rx_len > 0) {
-        fprintf(stderr, "  raw:");
-        for (size_t di = 0; di < rx_len && di < 32; di++) fprintf(stderr, " %02x", rx[di]);
-        if (rx_len > 32) fprintf(stderr, " ...(total %zu)", rx_len);
-        fprintf(stderr, "\n");
-        /* Find F7 */
-        for (size_t fi = 0; fi < rx_len; fi++) {
-            if (rx[fi] == 0xF7) { fprintf(stderr, "  F7 found at offset %zu\n", fi); break; }
-            if (fi == rx_len - 1) fprintf(stderr, "  NO F7 in buffer!\n");
-        }
-    }
     if (status != 0) return -1;
     if (rx_len < 6) return -2;
 
@@ -123,73 +111,51 @@ int s3k_fetch_sample_header(S3kClient *c, int sample_num, S3kSampleHeader *hdr) 
     if (op != OP_SDATA) return -4;
 
     /* Parse nibblized sample header.
-     * Payload starts with sample_number (2 nibbles), then header data. */
+     * Payload starts with sample_number (2 nibbles), then header fields.
+     * Each "byte" in the spec = 2 nibbles in the data stream.
+     * Field widths from Akai S2800/S3000 SysEx specification. */
     int off = 2; /* skip sample number nibbles */
-
-    /* Debug: print raw response */
-    fprintf(stderr, "s3k: RSDATA response: %zu bytes, op=0x%02x\n", payload_len, (int)op);
-    fprintf(stderr, "  raw:");
-    for (size_t di = 0; di < payload_len && di < 40; di++)
-        fprintf(stderr, " %02x", payload[di]);
-    if (payload_len > 40) fprintf(stderr, " ...");
-    fprintf(stderr, "\n");
-
     memset(hdr, 0, sizeof(*hdr));
 
-    /* SHIDENT (1 byte = 2 nibbles) */
-    if (off + 2 > (int)payload_len) return -5;
-    uint8_t ident = read_nibble_byte(payload, &off);
-    (void)ident; /* expected: 3 */
+#define NEED(n) if (off + (n) > (int)payload_len) return -5
+#define SKIP(n) off += (n) * 2  /* skip n bytes = n*2 nibbles */
 
-    /* SBANDW (1 byte) */
-    hdr->bandwidth = read_nibble_byte(payload, &off);
-
-    /* SPITCH (1 byte) */
-    hdr->pitch = read_nibble_byte(payload, &off);
+    NEED(2); read_nibble_byte(payload, &off);          /* SHIDENT (1 byte) */
+    NEED(2); hdr->bandwidth = read_nibble_byte(payload, &off);  /* SBANDW (1) */
+    NEED(2); hdr->pitch = read_nibble_byte(payload, &off);      /* SPITCH (1) */
 
     /* SHNAME (12 bytes = 24 nibbles) */
+    NEED(24);
     uint8_t name_raw[12];
     for (int i = 0; i < 12; i++)
         name_raw[i] = read_nibble_byte(payload, &off);
     akai_decode_name(name_raw, 12, hdr->name);
 
-    /* Skip: SSRVLD (1), SLOOPS (1) = 4 nibbles */
-    if (off + 4 <= (int)payload_len) {
-        read_nibble_byte(payload, &off); /* SSRVLD */
-        hdr->loop_count = read_nibble_byte(payload, &off);
-    }
+    NEED(2); read_nibble_byte(payload, &off);                   /* SSRVLD (1) */
+    NEED(2); hdr->loop_count = read_nibble_byte(payload, &off); /* SLOOPS (1) */
+    NEED(2); read_nibble_byte(payload, &off);                   /* SALOOP (1) */
+    NEED(2); read_nibble_byte(payload, &off);                   /* SHLOOP (1) */
+    NEED(2); hdr->play_type = read_nibble_byte(payload, &off);  /* SPTYPE (1) */
+    NEED(4); read_nibble_u16(payload, &off);                    /* STUNO (2) */
+    NEED(8); read_nibble_u32(payload, &off);                    /* SLOCAT (4) */
+    NEED(8); hdr->length = read_nibble_u32(payload, &off);      /* SLNGTH (4) */
+    NEED(8); hdr->start = read_nibble_u32(payload, &off);       /* SSTART (4) */
+    NEED(8); hdr->end = read_nibble_u32(payload, &off);         /* SMPEND (4) */
 
-    /* SPTYPE (1 byte) */
-    if (off + 2 <= (int)payload_len)
-        hdr->play_type = read_nibble_byte(payload, &off);
+    /* 4 loops × (LOOPAT:4 + LLNGTH:6 + LDWELL:2) = 4 × 12 = 48 bytes = 96 nibbles */
+    NEED(96); SKIP(48);
 
-    /* STUNO (2 bytes) — skip */
-    if (off + 4 <= (int)payload_len) read_nibble_u16(payload, &off);
+    /* 4 × SLXY: 12 bytes each = 48 bytes = 96 nibbles */
+    NEED(96); SKIP(48);
 
-    /* SLOCAT (4 bytes) — skip */
-    if (off + 8 <= (int)payload_len) read_nibble_u32(payload, &off);
+    /* SSPARE (1) + SWCOMM (1) + SSPAIR (2) = 4 bytes = 8 nibbles */
+    NEED(8); SKIP(4);
 
-    /* SLNGTH (4 bytes) */
-    if (off + 8 <= (int)payload_len)
-        hdr->length = read_nibble_u32(payload, &off);
+    /* SSRATE (2 bytes = 4 nibbles) */
+    NEED(4); hdr->sample_rate = read_nibble_u16(payload, &off);
 
-    /* SSTART (4 bytes) */
-    if (off + 8 <= (int)payload_len)
-        hdr->start = read_nibble_u32(payload, &off);
-
-    /* SMPEND (4 bytes) */
-    if (off + 8 <= (int)payload_len)
-        hdr->end = read_nibble_u32(payload, &off);
-
-    /* Skip loop data: 4 loops × (LOOPAT:4 + LLNGTH:6 + LDWELL:2) = 48 bytes = 96 nibbles */
-    /* Skip SLXY fields: 4 × 12 bytes = 48 bytes = 96 nibbles */
-    /* Then: SSRATE (2 bytes = 4 nibbles) */
-    int remaining_skip = 96 + 96; /* loops + SLXY */
-    if (off + remaining_skip + 4 <= (int)payload_len) {
-        off += remaining_skip;
-        hdr->sample_rate = read_nibble_u16(payload, &off);
-    }
-
+#undef NEED
+#undef SKIP
     return 0;
 }
 
