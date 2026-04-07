@@ -777,21 +777,180 @@ int main(int argc, char *argv[]) {
     status = scsi_bridge_exec(target, 0, cdb, 6, NULL, 0, NULL, NULL, 10);
     printf("  status=%d\n\n", status);
 
-    /* Step 3: Send SysEx Identity Request (F0 7E 00 06 01 F7) */
-    printf("--- Step 3: SEND MIDI DATA (Identity Request) ---\n");
-    uint8_t sysex_identity[] = { 0xF0, 0x7E, 0x00, 0x06, 0x01, 0xF7 };
+    /* Brief pause after MIDI mode enable */
+    usleep(200000);
+
+    /* Step 2b: TEST UNIT READY before send (MESA does this) */
+    printf("--- Step 2b: TEST UNIT READY (pre-send check) ---\n");
+    memset(cdb, 0, 6);
+    status = scsi_bridge_exec(target, 0, cdb, 6, NULL, 0, NULL, NULL, 10);
+    printf("  status=%d\n\n", status);
+
+    /* Step 3: Send AKAI SysEx — RSLIST */
+    printf("--- Step 3: SEND AKAI SYSEX (Request Sample Names) ---\n");
+    uint8_t sysex_identity[] = { 0xF0, 0x47, 0x00, 0x04, 0x48, 0xF7 };
     size_t sysex_len = sizeof(sysex_identity);
     cdb[0] = 0x0C; cdb[1] = 0x00;
-    cdb[2] = (sysex_len >> 16) & 0xFF;  /* length high */
-    cdb[3] = (sysex_len >> 8) & 0xFF;   /* length mid */
-    cdb[4] = sysex_len & 0xFF;          /* length low */
-    cdb[5] = 0x80;                       /* flag: reply expected */
-    printf("  CDB: %02x %02x %02x %02x %02x %02x\n", cdb[0],cdb[1],cdb[2],cdb[3],cdb[4],cdb[5]);
-    printf("  Data out (%zu bytes):", sysex_len);
-    for (size_t i = 0; i < sysex_len; i++) printf(" %02x", sysex_identity[i]);
+    cdb[2] = (sysex_len >> 16) & 0xFF;
+    cdb[3] = (sysex_len >> 8) & 0xFF;
+    cdb[4] = sysex_len & 0xFF;
+    cdb[5] = 0x00;  /* flag=0 works (0x80 causes CHECK CONDITION) */
+
+    /* Probe all exclusive channels 0-15 to find the device */
+    int found_channel = -1;
+    for (int ch = 0; ch < 16 && found_channel < 0; ch++) {
+        sysex_identity[2] = ch;
+        printf("  ch=%d: F0 47 %02x 04 48 F7 → ", ch, ch);
+        status = scsi_bridge_exec(target, 0, cdb, 6, sysex_identity, sysex_len, NULL, NULL, 10);
+        usleep(100000);
+        /* Poll */
+        uint8_t poll_cdb[6] = { 0x0D, 0, 0, 0, 0, 0x00 };
+        uint8_t poll_buf[3] = {0};
+        size_t poll_len = 3;
+        scsi_bridge_exec(target, 0, poll_cdb, 6, NULL, 0, poll_buf, &poll_len, 10);
+        uint32_t avail = 0;
+        if (poll_len >= 3)
+            avail = ((uint32_t)poll_buf[0]<<16)|((uint32_t)poll_buf[1]<<8)|poll_buf[2];
+        printf("send=%d, avail=%u\n", status, avail);
+        if (avail > 0) { found_channel = ch; break; }
+    }
+    if (found_channel >= 0) {
+        printf("  *** Found device on exclusive channel %d! ***\n", found_channel);
+        /* Read the sample name list response */
+        uint8_t rd_cdb[6] = { 0x0E, 0, 0, 0, 0, 0x00 };
+        uint32_t avail_now = 0;
+        /* Re-poll to get current count (probe already polled) */
+        {
+            uint8_t poll_cdb2[6] = { 0x0D, 0, 0, 0, 0, 0x00 };
+            uint8_t pb2[3] = {0};
+            size_t pb2_len = 3;
+            /* The probe already read the count; send RSLIST again on found channel */
+            sysex_identity[2] = found_channel;
+            cdb[0] = 0x0C; cdb[1]=0; cdb[2]=0; cdb[3]=0; cdb[4]=sysex_len; cdb[5]=0x00;
+            scsi_bridge_exec(target, 0, cdb, 6, sysex_identity, sysex_len, NULL, NULL, 10);
+            usleep(200000);
+            scsi_bridge_exec(target, 0, poll_cdb2, 6, NULL, 0, pb2, &pb2_len, 10);
+            if (pb2_len >= 3)
+                avail_now = ((uint32_t)pb2[0]<<16)|((uint32_t)pb2[1]<<8)|pb2[2];
+        }
+        if (avail_now > 0) {
+            printf("\n--- Reading SAMPLE NAME LIST (%u bytes) ---\n", avail_now);
+            if (avail_now > sizeof(buf)) avail_now = sizeof(buf);
+            rd_cdb[2] = (avail_now>>16)&0xFF;
+            rd_cdb[3] = (avail_now>>8)&0xFF;
+            rd_cdb[4] = avail_now&0xFF;
+            buf_len = avail_now;
+            memset(buf, 0, buf_len);
+            status = scsi_bridge_exec(target, 0, rd_cdb, 6, NULL, 0, buf, &buf_len, 10);
+            printf("  status=%d, received %zu bytes\n", status, buf_len);
+            if (buf_len > 0) {
+                printf("  Raw:");
+                for (size_t i = 0; i < buf_len && i < 80; i++) {
+                    printf(" %02x", buf[i]);
+                    if (i > 0 && buf[i] == 0xF7) { printf(" (EoSx)"); break; }
+                }
+                if (buf_len > 80) printf(" ...");
+                printf("\n");
+
+                /* Decode Akai name list */
+                if (buf_len >= 6 && buf[0] == 0xF0 && buf[1] == 0x47) {
+                    unsigned int opcode_r = buf[3];
+                    if (opcode_r == 0x05 && buf_len >= 8) {
+                        int count = buf[5] | (buf[6] << 8);
+                        printf("\n  SAMPLES (%d):\n", count);
+                        int off = 7;
+                        for (int i = 0; i < count && off + 12 <= (int)buf_len; i++) {
+                            char name[13];
+                            for (int j = 0; j < 12; j++) {
+                                unsigned char c = buf[off + j];
+                                if (c <= 9) name[j] = '0' + c;
+                                else if (c == 10) name[j] = ' ';
+                                else if (c >= 11 && c <= 36) name[j] = 'A' + (c - 11);
+                                else if (c >= 37 && c <= 62) name[j] = 'a' + (c - 37);
+                                else if (c == 63) name[j] = '#';
+                                else if (c == 64) name[j] = '+';
+                                else if (c == 65) name[j] = '-';
+                                else if (c == 66) name[j] = '.';
+                                else name[j] = '?';
+                            }
+                            name[12] = '\0';
+                            printf("    %3d: \"%s\"\n", i, name);
+                            off += 12;
+                        }
+                    }
+                }
+            }
+        }
+
+        /* Now request PROGRAM names */
+        printf("\n--- Requesting PROGRAM NAME LIST ---\n");
+        uint8_t rplist[] = { 0xF0, 0x47, (uint8_t)found_channel, 0x02, 0x48, 0xF7 };
+        cdb[0]=0x0C; cdb[1]=0; cdb[2]=0; cdb[3]=0; cdb[4]=sizeof(rplist); cdb[5]=0x00;
+        scsi_bridge_exec(target, 0, cdb, 6, rplist, sizeof(rplist), NULL, NULL, 10);
+        usleep(200000);
+        {
+            uint8_t poll_cdb3[6] = { 0x0D, 0, 0, 0, 0, 0x00 };
+            uint8_t pb3[3] = {0};
+            size_t pb3_len = 3;
+            scsi_bridge_exec(target, 0, poll_cdb3, 6, NULL, 0, pb3, &pb3_len, 10);
+            uint32_t pavail = 0;
+            if (pb3_len >= 3)
+                pavail = ((uint32_t)pb3[0]<<16)|((uint32_t)pb3[1]<<8)|pb3[2];
+            if (pavail > 0) {
+                printf("  %u bytes available\n", pavail);
+                if (pavail > sizeof(buf)) pavail = sizeof(buf);
+                rd_cdb[2]=(pavail>>16)&0xFF; rd_cdb[3]=(pavail>>8)&0xFF; rd_cdb[4]=pavail&0xFF;
+                buf_len = pavail;
+                memset(buf, 0, buf_len);
+                status = scsi_bridge_exec(target, 0, rd_cdb, 6, NULL, 0, buf, &buf_len, 10);
+                printf("  received %zu bytes\n", buf_len);
+                if (buf_len >= 8 && buf[0]==0xF0 && buf[1]==0x47 && buf[3]==0x03) {
+                    int cnt = buf[5]|(buf[6]<<8);
+                    printf("\n  PROGRAMS (%d):\n", cnt);
+                    int off = 7;
+                    for (int i = 0; i < cnt && off+12<=(int)buf_len; i++) {
+                        char nm[13];
+                        for (int j=0;j<12;j++) {
+                            unsigned char c=buf[off+j];
+                            if(c<=9)nm[j]='0'+c; else if(c==10)nm[j]=' ';
+                            else if(c>=11&&c<=36)nm[j]='A'+(c-11);
+                            else if(c>=37&&c<=62)nm[j]='a'+(c-37);
+                            else if(c==63)nm[j]='#'; else if(c==64)nm[j]='+';
+                            else if(c==65)nm[j]='-'; else if(c==66)nm[j]='.';
+                            else nm[j]='?';
+                        }
+                        nm[12]='\0';
+                        printf("    %3d: \"%s\"\n", i, nm);
+                        off += 12;
+                    }
+                }
+            } else {
+                printf("  No program data available.\n");
+            }
+        }
+    } else {
+        printf("  No response on any channel. Device may have SysEx disabled.\n");
+    }
+
+    /* If CHECK CONDITION, send REQUEST SENSE to get the error details */
+    if (status < 0) {
+        printf("  Sending REQUEST SENSE...\n");
+        cdb[0] = 0x03; cdb[1] = 0; cdb[2] = 0; cdb[3] = 0;
+        cdb[4] = 18;  /* allocation length */
+        cdb[5] = 0;
+        buf_len = 18;
+        status = scsi_bridge_exec(target, 0, cdb, 6, NULL, 0, buf, &buf_len, 10);
+        printf("  REQUEST SENSE status=%d, %zu bytes:", status, buf_len);
+        for (size_t i = 0; i < buf_len; i++) printf(" %02x", buf[i]);
+        printf("\n");
+        if (buf_len >= 3) {
+            printf("  Sense key: 0x%x, ASC: 0x%02x, ASCQ: 0x%02x\n",
+                buf[2] & 0x0F,
+                buf_len >= 13 ? buf[12] : 0,
+                buf_len >= 14 ? buf[13] : 0);
+        }
+    }
     printf("\n");
-    status = scsi_bridge_exec(target, 0, cdb, 6, sysex_identity, sysex_len, NULL, NULL, 10);
-    printf("  status=%d\n\n", status);
 
     /* Step 4: Poll for reply — Data Byte Enquiry */
     printf("--- Step 4: DATA BYTE ENQUIRY (poll for reply) ---\n");
@@ -835,16 +994,46 @@ int main(int argc, char *argv[]) {
             }
             printf("\n");
 
-            /* Decode SysEx Identity Reply if present */
-            if (buf_len >= 5 && buf[0] == 0xF0 && buf[1] == 0x7E) {
-                printf("\n  SysEx Identity Reply:\n");
-                printf("    Device ID: %d\n", buf[2]);
-                if (buf_len >= 12) {
-                    printf("    Manufacturer: %02x %02x %02x\n", buf[5], buf[6], buf[7]);
-                    printf("    Family: %02x %02x\n", buf[8], buf[9]);
-                    printf("    Model: %02x %02x\n", buf[10], buf[11]);
-                    if (buf_len >= 16)
-                        printf("    Version: %02x %02x %02x %02x\n", buf[12], buf[13], buf[14], buf[15]);
+            /* Decode Akai SysEx response */
+            if (buf_len >= 6 && buf[0] == 0xF0 && buf[1] == 0x47) {
+                unsigned int channel = buf[2];
+                unsigned int opcode = buf[3];
+                unsigned int device_id = buf[4];
+                printf("\n  Akai SysEx: channel=%d opcode=0x%02x device=0x%02x\n",
+                    channel, opcode, device_id);
+
+                /* Opcode 0x05 = SLIST (sample name list response) */
+                /* Opcode 0x03 = PLIST (program name list response) */
+                if ((opcode == 0x05 || opcode == 0x03) && buf_len >= 8) {
+                    int count = buf[5] | (buf[6] << 8);  /* 16-bit LE count */
+                    const char *kind = (opcode == 0x05) ? "Sample" : "Program";
+                    printf("  %s count: %d\n", kind, count);
+                    int offset = 7;
+                    for (int i = 0; i < count && offset + 12 <= (int)buf_len; i++) {
+                        /* Each name is 12 bytes, Akai encoding (roughly ASCII with some mapping) */
+                        char name[13];
+                        for (int j = 0; j < 12; j++) {
+                            unsigned char c = buf[offset + j];
+                            /* Basic Akai→ASCII: 0-9 = '0'-'9', 10-35 = ' ','A'-'Z', etc. */
+                            if (c <= 9) name[j] = '0' + c;
+                            else if (c == 10) name[j] = ' ';
+                            else if (c >= 11 && c <= 36) name[j] = 'A' + (c - 11);
+                            else if (c >= 37 && c <= 62) name[j] = 'a' + (c - 37);
+                            else if (c == 63) name[j] = '#';
+                            else if (c == 64) name[j] = '+';
+                            else if (c == 65) name[j] = '-';
+                            else if (c == 66) name[j] = '.';
+                            else name[j] = '?';
+                        }
+                        name[12] = '\0';
+                        printf("    %3d: \"%s\"\n", i, name);
+                        offset += 12;
+                    }
+                }
+                /* Opcode 0x16 = REPLY (error or OK) */
+                else if (opcode == 0x16) {
+                    int code = (buf_len > 5) ? buf[5] : -1;
+                    printf("  Reply: %s (code=%d)\n", code == 0 ? "OK" : "ERROR", code);
                 }
             }
         }
@@ -852,8 +1041,128 @@ int main(int argc, char *argv[]) {
         printf("\n  No reply data available.\n");
     }
 
-    /* Step 6: Disable MIDI mode */
-    printf("\n--- Step 6: SET MIDI MODE (disable) ---\n");
+    /* Step 6: Now try AKAI SysEx — RSLIST (sample names) */
+    printf("\n--- Step 6: SEND AKAI SYSEX (Request Sample Names) ---\n");
+    {
+        /* Try multiple exclusive channels: 0x00 (default), then 0x7F (all) */
+        int channels[] = { 0x00, 0x7F };
+        for (int ci = 0; ci < 2; ci++) {
+            int ch = channels[ci];
+            uint8_t rslist[] = { 0xF0, 0x47, (uint8_t)ch, 0x04, 0x48, 0xF7 };
+            printf("  Trying channel %d: F0 47 %02x 04 48 F7\n", ch, ch);
+            cdb[0] = 0x0C; cdb[1] = 0; cdb[2] = 0; cdb[3] = 0;
+            cdb[4] = sizeof(rslist); cdb[5] = 0x80;
+            status = scsi_bridge_exec(target, 0, cdb, 6, rslist, sizeof(rslist), NULL, NULL, 10);
+            printf("  send status=%d\n", status);
+            usleep(200000);
+
+            /* Poll */
+            cdb[0] = 0x0D; cdb[1]=0; cdb[2]=0; cdb[3]=0; cdb[4]=0; cdb[5]=0x80;
+            buf_len = 3;
+            status = scsi_bridge_exec(target, 0, cdb, 6, NULL, 0, buf, &buf_len, 10);
+            reply_len = 0;
+            if (buf_len >= 3)
+                reply_len = ((uint32_t)buf[0] << 16) | ((uint32_t)buf[1] << 8) | buf[2];
+            printf("  poll: %u bytes available\n", reply_len);
+
+            if (reply_len > 0) {
+                if (reply_len > sizeof(buf)) reply_len = sizeof(buf);
+                cdb[0] = 0x0E; cdb[1]=0;
+                cdb[2]=(reply_len>>16)&0xFF; cdb[3]=(reply_len>>8)&0xFF;
+                cdb[4]=reply_len&0xFF; cdb[5]=0x80;
+                buf_len = reply_len;
+                memset(buf, 0, buf_len);
+                status = scsi_bridge_exec(target, 0, cdb, 6, NULL, 0, buf, &buf_len, 10);
+                printf("  received %zu bytes:", buf_len);
+                for (size_t i = 0; i < buf_len && i < 80; i++) {
+                    printf(" %02x", buf[i]);
+                    if (i > 0 && buf[i] == 0xF7) { printf(" (EoSx)"); break; }
+                }
+                printf("\n");
+                break;  /* Got a response, stop trying channels */
+            }
+        }
+    }
+
+    /* Step 7: Request Program Name List (RPLIST = 0x02) */
+    printf("\n--- Step 6: SEND AKAI SYSEX (Request Program Names) ---\n");
+    {
+        uint8_t rplist[] = { 0xF0, 0x47, 0x00, 0x02, 0x48, 0xF7 };
+        size_t rplist_len = sizeof(rplist);
+        cdb[0] = 0x0C; cdb[1] = 0x00;
+        cdb[2] = 0; cdb[3] = 0; cdb[4] = rplist_len & 0xFF; cdb[5] = 0x80;
+        printf("  SysEx: F0 47 00 02 48 F7 (RPLIST)\n");
+        status = scsi_bridge_exec(target, 0, cdb, 6, rplist, rplist_len, NULL, NULL, 10);
+        printf("  send status=%d\n", status);
+
+        /* Poll for reply */
+        usleep(100000);
+        cdb[0] = 0x0D; cdb[1] = 0; cdb[2] = 0; cdb[3] = 0; cdb[4] = 0; cdb[5] = 0x80;
+        buf_len = 3;
+        reply_len = 0;
+        retries = 10;
+        while (retries-- > 0) {
+            buf_len = 3;
+            status = scsi_bridge_exec(target, 0, cdb, 6, NULL, 0, buf, &buf_len, 10);
+            if (buf_len >= 3) {
+                reply_len = ((uint32_t)buf[0] << 16) | ((uint32_t)buf[1] << 8) | buf[2];
+                printf("  poll: %u bytes available\n", reply_len);
+                if (reply_len > 0) break;
+            }
+            usleep(100000);
+        }
+        if (reply_len > 0) {
+            if (reply_len > sizeof(buf)) reply_len = sizeof(buf);
+            cdb[0] = 0x0E; cdb[1] = 0;
+            cdb[2] = (reply_len >> 16) & 0xFF;
+            cdb[3] = (reply_len >> 8) & 0xFF;
+            cdb[4] = reply_len & 0xFF; cdb[5] = 0x80;
+            buf_len = reply_len;
+            memset(buf, 0, buf_len);
+            status = scsi_bridge_exec(target, 0, cdb, 6, NULL, 0, buf, &buf_len, 10);
+            printf("  received %zu bytes\n", buf_len);
+            if (buf_len > 0) {
+                printf("  MIDI response:");
+                for (size_t i = 0; i < buf_len && i < 80; i++) {
+                    printf(" %02x", buf[i]);
+                    if (i > 0 && buf[i] == 0xF7) { printf(" (EoSx)"); break; }
+                }
+                if (buf_len > 80) printf(" ...");
+                printf("\n");
+
+                /* Decode Akai name list */
+                if (buf_len >= 6 && buf[0] == 0xF0 && buf[1] == 0x47) {
+                    unsigned int opcode2 = buf[3];
+                    if (opcode2 == 0x03 && buf_len >= 8) {
+                        int count2 = buf[5] | (buf[6] << 8);
+                        printf("\n  Program count: %d\n", count2);
+                        int off = 7;
+                        for (int i = 0; i < count2 && off + 12 <= (int)buf_len; i++) {
+                            char name[13];
+                            for (int j = 0; j < 12; j++) {
+                                unsigned char c = buf[off + j];
+                                if (c <= 9) name[j] = '0' + c;
+                                else if (c == 10) name[j] = ' ';
+                                else if (c >= 11 && c <= 36) name[j] = 'A' + (c - 11);
+                                else if (c >= 37 && c <= 62) name[j] = 'a' + (c - 37);
+                                else if (c == 63) name[j] = '#';
+                                else if (c == 64) name[j] = '+';
+                                else if (c == 65) name[j] = '-';
+                                else if (c == 66) name[j] = '.';
+                                else name[j] = '?';
+                            }
+                            name[12] = '\0';
+                            printf("    %3d: \"%s\"\n", i, name);
+                            off += 12;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /* Step 7: Disable MIDI mode */
+    printf("\n--- Step 7: SET MIDI MODE (disable) ---\n");
     cdb[0] = 0x09; cdb[1] = 0x00; cdb[2] = 0x00;
     cdb[3] = 0x00; cdb[4] = 0x00; cdb[5] = 0x00;
     status = scsi_bridge_exec(target, 0, cdb, 6, NULL, 0, NULL, NULL, 10);

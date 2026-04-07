@@ -240,8 +240,15 @@ int scsi_bridge_exec(int target_id, int target_lun,
         }
     }
 
-    if (!got_result_status)
-        return -3;  /* Couldn't parse response at all */
+    if (!got_result_status) {
+        /* PbResult.status is false (0) or missing — check for error message */
+        for (auto &f : fields) {
+            if (f.field_num == 2 && f.wire_type == 2) {
+                fprintf(stderr, "scsi_bridge: error: %.*s\n", (int)f.bytes_len, f.bytes_ptr);
+            }
+        }
+        return -2;
+    }
 
     return scsi_status;
 }
