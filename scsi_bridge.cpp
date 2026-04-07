@@ -212,16 +212,17 @@ int scsi_bridge_exec(int target_id, int target_lun,
     }
 
     /* Parse PbResult → PbScsiResponse */
-    int scsi_status = -1;
+    int scsi_status = 0;  /* Default to success (GOOD) */
+    bool got_result_status = false;
     auto fields = pb_parse(result.data(), result.size());
     for (auto &f : fields) {
         if (f.field_num == 1 && f.wire_type == 0) {
+            got_result_status = true;
             if (!f.varint_val) {
-                fprintf(stderr, "scsi_bridge: s2p returned error\n");
-                /* Check for error message in field 2 */
+                /* s2p reported failure — check for error message */
                 for (auto &g : fields)
                     if (g.field_num == 2 && g.wire_type == 2)
-                        fprintf(stderr, "  msg: %.*s\n", (int)g.bytes_len, g.bytes_ptr);
+                        fprintf(stderr, "scsi_bridge: error: %.*s\n", (int)g.bytes_len, g.bytes_ptr);
                 return -2;
             }
         }
@@ -238,6 +239,9 @@ int scsi_bridge_exec(int target_id, int target_lun,
             }
         }
     }
+
+    if (!got_result_status)
+        return -3;  /* Couldn't parse response at all */
 
     return scsi_status;
 }

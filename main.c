@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <unistd.h>
 #include "musashi/m68k.h"
 #include "scsi_bridge.h"
 
@@ -744,5 +745,124 @@ int main(int argc, char *argv[]) {
 
     run_subroutine(stub, "SCSI INQUIRY stub");
 
+    /* ================================================================== */
+    /* Phase 3: MIDI-over-SCSI protocol — talk to the S3000XL directly    */
+    /* ================================================================== */
+    printf("\n========================================\n");
+    printf("Phase 3: MIDI-over-SCSI Protocol\n");
+    printf("========================================\n\n");
+
+    int target = 6;
+    uint8_t cdb[6];
+    uint8_t buf[4096];
+    size_t buf_len;
+    int status;
+
+    /* Step 1: TEST UNIT READY */
+    printf("--- Step 1: TEST UNIT READY ---\n");
+    memset(cdb, 0, 6);  /* CDB: 00 00 00 00 00 00 */
+    status = scsi_bridge_exec(target, 0, cdb, 6, NULL, 0, NULL, NULL, 10);
+    printf("  status=%d %s\n\n", status, status == 0 ? "(ready)" : "(NOT ready)");
+    if (status != 0) {
+        printf("Device not ready, aborting.\n");
+        free(g_mem);
+        return 1;
+    }
+
+    /* Step 2: Enable MIDI mode */
+    printf("--- Step 2: SET MIDI MODE (enable) ---\n");
+    cdb[0] = 0x09; cdb[1] = 0x00; cdb[2] = 0x01; /* MIDI on */
+    cdb[3] = 0x00; /* thru off */ cdb[4] = 0x00; cdb[5] = 0x00;
+    printf("  CDB: %02x %02x %02x %02x %02x %02x\n", cdb[0],cdb[1],cdb[2],cdb[3],cdb[4],cdb[5]);
+    status = scsi_bridge_exec(target, 0, cdb, 6, NULL, 0, NULL, NULL, 10);
+    printf("  status=%d\n\n", status);
+
+    /* Step 3: Send SysEx Identity Request (F0 7E 00 06 01 F7) */
+    printf("--- Step 3: SEND MIDI DATA (Identity Request) ---\n");
+    uint8_t sysex_identity[] = { 0xF0, 0x7E, 0x00, 0x06, 0x01, 0xF7 };
+    size_t sysex_len = sizeof(sysex_identity);
+    cdb[0] = 0x0C; cdb[1] = 0x00;
+    cdb[2] = (sysex_len >> 16) & 0xFF;  /* length high */
+    cdb[3] = (sysex_len >> 8) & 0xFF;   /* length mid */
+    cdb[4] = sysex_len & 0xFF;          /* length low */
+    cdb[5] = 0x80;                       /* flag: reply expected */
+    printf("  CDB: %02x %02x %02x %02x %02x %02x\n", cdb[0],cdb[1],cdb[2],cdb[3],cdb[4],cdb[5]);
+    printf("  Data out (%zu bytes):", sysex_len);
+    for (size_t i = 0; i < sysex_len; i++) printf(" %02x", sysex_identity[i]);
+    printf("\n");
+    status = scsi_bridge_exec(target, 0, cdb, 6, sysex_identity, sysex_len, NULL, NULL, 10);
+    printf("  status=%d\n\n", status);
+
+    /* Step 4: Poll for reply — Data Byte Enquiry */
+    printf("--- Step 4: DATA BYTE ENQUIRY (poll for reply) ---\n");
+    int retries = 10;
+    uint32_t reply_len = 0;
+    while (retries-- > 0) {
+        cdb[0] = 0x0D; cdb[1] = 0x00; cdb[2] = 0x00;
+        cdb[3] = 0x00; cdb[4] = 0x00; cdb[5] = 0x80;
+        buf_len = 3;
+        status = scsi_bridge_exec(target, 0, cdb, 6, NULL, 0, buf, &buf_len, 10);
+        if (buf_len >= 3) {
+            reply_len = ((uint32_t)buf[0] << 16) | ((uint32_t)buf[1] << 8) | buf[2];
+            printf("  status=%d, bytes available: %u (raw: %02x %02x %02x)\n",
+                status, reply_len, buf[0], buf[1], buf[2]);
+            if (reply_len > 0) break;
+        } else {
+            printf("  status=%d, no data (buf_len=%zu)\n", status, buf_len);
+        }
+        /* Brief pause before retry */
+        usleep(100000);  /* 100ms */
+    }
+
+    /* Step 5: Read reply if available */
+    if (reply_len > 0) {
+        printf("\n--- Step 5: RECEIVE MIDI DATA (%u bytes) ---\n", reply_len);
+        if (reply_len > sizeof(buf)) reply_len = sizeof(buf);
+        cdb[0] = 0x0E; cdb[1] = 0x00;
+        cdb[2] = (reply_len >> 16) & 0xFF;
+        cdb[3] = (reply_len >> 8) & 0xFF;
+        cdb[4] = reply_len & 0xFF;
+        cdb[5] = 0x80;
+        buf_len = reply_len;
+        memset(buf, 0, buf_len);
+        status = scsi_bridge_exec(target, 0, cdb, 6, NULL, 0, buf, &buf_len, 10);
+        printf("  status=%d, received %zu bytes\n", status, buf_len);
+        if (buf_len > 0) {
+            printf("  MIDI response:");
+            for (size_t i = 0; i < buf_len; i++) {
+                printf(" %02x", buf[i]);
+                if (i > 0 && buf[i] == 0xF7) { printf(" (End of SysEx)"); break; }
+            }
+            printf("\n");
+
+            /* Decode SysEx Identity Reply if present */
+            if (buf_len >= 5 && buf[0] == 0xF0 && buf[1] == 0x7E) {
+                printf("\n  SysEx Identity Reply:\n");
+                printf("    Device ID: %d\n", buf[2]);
+                if (buf_len >= 12) {
+                    printf("    Manufacturer: %02x %02x %02x\n", buf[5], buf[6], buf[7]);
+                    printf("    Family: %02x %02x\n", buf[8], buf[9]);
+                    printf("    Model: %02x %02x\n", buf[10], buf[11]);
+                    if (buf_len >= 16)
+                        printf("    Version: %02x %02x %02x %02x\n", buf[12], buf[13], buf[14], buf[15]);
+                }
+            }
+        }
+    } else {
+        printf("\n  No reply data available.\n");
+    }
+
+    /* Step 6: Disable MIDI mode */
+    printf("\n--- Step 6: SET MIDI MODE (disable) ---\n");
+    cdb[0] = 0x09; cdb[1] = 0x00; cdb[2] = 0x00;
+    cdb[3] = 0x00; cdb[4] = 0x00; cdb[5] = 0x00;
+    status = scsi_bridge_exec(target, 0, cdb, 6, NULL, 0, NULL, NULL, 10);
+    printf("  status=%d\n", status);
+
+    printf("\n========================================\n");
+    printf("MIDI-over-SCSI protocol complete.\n");
+    printf("========================================\n");
+
+    free(g_mem);
     return 0;
 }
