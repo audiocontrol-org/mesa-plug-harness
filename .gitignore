@@ -1,0 +1,8 @@
+# Build artifacts
+plug-harness
+*.o
+
+# Musashi generated files
+musashi/m68kmake
+musashi/m68kops.c
+musashi/m68kops.h
