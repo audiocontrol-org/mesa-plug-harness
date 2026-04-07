@@ -542,6 +542,112 @@ static int s3k_write(S3kClient *c, AkaiOpcode op, const uint8_t *data, size_t da
     return 0;
 }
 
+/* ---- Read-modify-write ---- */
+
+/* Program header field nibble offsets (from start of payload, after 2 nibbles for program number).
+ * Add 2 to skip the program number. The "offset=1" from audiocontrol adds 2 more.
+ * So field byte N in the spec → nibble offset (N + 1) * 2 from payload start.
+ * Simpler: payload nibble offset = 2 (program#) + 2 (preamble) + field_byte * 2 */
+/* reloff starts at 1 (the audiocontrol offset=1 parameter), so byte_off=1 is the first
+ * field (KGRP1). Payload has 2 nibbles for program# + 2 nibbles preamble = 4 total.
+ * KGRP1 (reloff=1) → nibble 4. PRNAME (reloff=3) → nibble 8. Formula: 2 + reloff*2. */
+#define PROG_FIELD_NIB(reloff) (2 + (reloff) * 2)
+
+int s3k_modify_program(S3kClient *c, int program_num, const char *field, const char *value) {
+    /* Fetch raw response */
+    uint8_t raw[S3K_MAX_RESPONSE];
+    size_t raw_len = sizeof(raw);
+    int status = s3k_fetch_raw(c, OP_RPDATA, program_num, raw, &raw_len);
+    if (status != 0) return -1;
+
+    /* Get payload pointer (skip SysEx header) */
+    AkaiOpcode op;
+    const uint8_t *payload_const;
+    size_t payload_len;
+    if (!akai_parse_response(raw, raw_len, &op, &payload_const, &payload_len))
+        return -2;
+
+    /* We'll modify the raw buffer directly (payload is inside raw) */
+    uint8_t *payload = raw + SYSEX_HEADER_SIZE;
+
+    /* Patch the requested field */
+    if (strcmp(field, "name") == 0) {
+        /* PRNAME at byte 3, 12 bytes = 24 nibbles */
+        int off = PROG_FIELD_NIB(3);
+        /* Pad value to 12 chars */
+        char padded[13] = "            ";
+        strncpy(padded, value, 12);
+        for (int i = 0; i < 12; i++)
+            write_nibble_byte(payload, &off, ascii_to_akai(padded[i]));
+    } else if (strcmp(field, "loudness") == 0) {
+        /* PRLOUD at byte 25, 1 byte */
+        int off = PROG_FIELD_NIB(25);
+        write_nibble_byte(payload, &off, atoi(value) & 0xFF);
+    } else if (strcmp(field, "pan") == 0) {
+        /* PANPOS at byte 24, 1 byte (signed) */
+        int off = PROG_FIELD_NIB(24);
+        write_nibble_byte(payload, &off, (uint8_t)(int8_t)atoi(value));
+    } else if (strcmp(field, "channel") == 0) {
+        /* PMCHAN at byte 16, 1 byte (0-15 or 255=OMNI) */
+        int off = PROG_FIELD_NIB(16);
+        int ch = atoi(value);
+        write_nibble_byte(payload, &off, (ch < 0 || ch > 15) ? 255 : ch);
+    } else {
+        fprintf(stderr, "Unknown program field: %s\n", field);
+        return -3;
+    }
+
+    return s3k_write_program_header(c, program_num, raw, raw_len);
+}
+
+/* Keygroup payload: 3 bytes preamble (2 nibbles program# + 1 raw byte kg#),
+ * then nibblized data starting at byte 0 of the spec. */
+#define KG_FIELD_NIB(byte_off) (3 + (byte_off) * 2)
+
+int s3k_modify_keygroup(S3kClient *c, int program_num, int kg_num,
+                         const char *field, const char *value) {
+    /* Fetch raw */
+    uint8_t req_data[3];
+    byte_to_nibbles(program_num & 0xFF, req_data);
+    req_data[2] = kg_num;
+    auto msg = akai_build_sysex(c->channel, OP_RKDATA, req_data, 3);
+    scsi_midi_send(&c->midi, msg.data(), msg.size());
+    usleep(200000);
+
+    uint8_t raw[S3K_MAX_RESPONSE];
+    size_t raw_len = sizeof(raw);
+    int status = scsi_midi_receive(&c->midi, raw, &raw_len, 30);
+    if (status != 0) return -1;
+
+    AkaiOpcode op;
+    const uint8_t *payload_const;
+    size_t payload_len;
+    if (!akai_parse_response(raw, raw_len, &op, &payload_const, &payload_len))
+        return -2;
+
+    uint8_t *payload = raw + SYSEX_HEADER_SIZE;
+
+    if (strcmp(field, "sample1") == 0) {
+        /* SNAME1 at byte 34, 12 bytes */
+        int off = KG_FIELD_NIB(34);
+        char padded[13] = "            ";
+        strncpy(padded, value, 12);
+        for (int i = 0; i < 12; i++)
+            write_nibble_byte(payload, &off, ascii_to_akai(padded[i]));
+    } else if (strcmp(field, "lonote") == 0) {
+        int off = KG_FIELD_NIB(3);
+        write_nibble_byte(payload, &off, atoi(value) & 0x7F);
+    } else if (strcmp(field, "hinote") == 0) {
+        int off = KG_FIELD_NIB(4);
+        write_nibble_byte(payload, &off, atoi(value) & 0x7F);
+    } else {
+        fprintf(stderr, "Unknown keygroup field: %s\n", field);
+        return -3;
+    }
+
+    return s3k_write_keygroup_header(c, program_num, kg_num, raw, raw_len);
+}
+
 int s3k_fetch_raw(S3kClient *c, AkaiOpcode op, int item_num,
                   uint8_t *response, size_t *response_len)
 {

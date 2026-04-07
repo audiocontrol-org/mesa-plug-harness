@@ -84,6 +84,14 @@ void akai_decode_name(const uint8_t *raw, int len, char *out)
         out[i] = '\0';
 }
 
+void akai_encode_name(const char *ascii, uint8_t *nibble_data, int *offset) {
+    for (int i = 0; i < 12; i++) {
+        char c = (ascii && ascii[i]) ? ascii[i] : ' ';
+        if (c == '\0') c = ' '; /* pad with spaces */
+        write_nibble_byte(nibble_data, offset, ascii_to_akai(c));
+    }
+}
+
 int akai_parse_name_list(const uint8_t *payload, size_t payload_len,
                          char names[][13], int max_names)
 {

@@ -113,6 +113,15 @@ int s3k_delete_sample(S3kClient *c, int sample_num);
 int s3k_upload_sample(S3kClient *c, int sample_num, const int16_t *samples,
                       int num_samples, int sample_rate);
 
+/* Modify a program field. field_name is one of: "name", "loudness", "pan", "channel".
+ * Returns 0 on success. */
+int s3k_modify_program(S3kClient *c, int program_num, const char *field, const char *value);
+
+/* Modify a keygroup field. field_name: "sample1", "lonote", "hinote".
+ * Returns 0 on success. */
+int s3k_modify_keygroup(S3kClient *c, int program_num, int kg_num,
+                         const char *field, const char *value);
+
 /* Fetch raw SysEx response (for read-modify-write operations).
  * Returns response length (negative on error). */
 int s3k_fetch_raw(S3kClient *c, AkaiOpcode op, int item_num,

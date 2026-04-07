@@ -93,6 +93,18 @@ inline uint32_t read_nibble_u32(const uint8_t *data, int *offset) {
     return lo | (hi << 16);
 }
 
+/* Write a byte as 2 nibbles into the stream */
+inline void write_nibble_byte(uint8_t *data, int *offset, uint8_t val) {
+    uint8_t nib[2];
+    byte_to_nibbles(val, nib);
+    data[*offset] = nib[0];
+    data[*offset + 1] = nib[1];
+    *offset += 2;
+}
+
+/* Write a 12-byte Akai name into nibble stream (24 nibbles) */
+void akai_encode_name(const char *ascii, uint8_t *nibble_data, int *offset);
+
 /* ---- Akai character encoding ---- */
 char akai_to_ascii(uint8_t c);
 uint8_t ascii_to_akai(char c);

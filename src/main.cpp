@@ -43,6 +43,9 @@ static void usage(const char *prog) {
         "  sample-header N      Show sample header for sample N\n"
         "  program-header N     Show program header for program N\n"
         "  keygroup P K         Show keygroup K of program P\n"
+        "  modify-program N FIELD VALUE  Modify program field (name,loudness,pan,channel)\n"
+        "  modify-keygroup P K FIELD VAL Modify keygroup field (sample1,lonote,hinote)\n"
+        "  misc-data                     Show device miscellaneous data\n"
         "  download-sample N [file.wav]  Download sample N as WAV\n"
         "  upload-sample N file.wav      Upload WAV to sample N\n"
         "  delete-sample N               Delete sample N\n"
@@ -331,6 +334,63 @@ int main(int argc, char *argv[]) {
         printf("Deleting sample %d...\n", sn);
         result = s3k_delete_sample(&client, sn);
         printf("%s\n", result == 0 ? "OK" : "Failed");
+    }
+    else if (strcmp(cmd, "modify-program") == 0 && i + 2 < argc) {
+        int pn = atoi(argv[i++]);
+        const char *field = argv[i++];
+        const char *val = argv[i];
+        printf("Modifying program %d: %s = %s\n", pn, field, val);
+        result = s3k_modify_program(&client, pn, field, val);
+        if (result == 0) {
+            printf("OK — verifying:\n");
+            usleep(500000);
+            cmd_program_header(&client, pn);
+        } else {
+            fprintf(stderr, "Modify failed (status=%d)\n", result);
+        }
+    }
+    else if (strcmp(cmd, "modify-keygroup") == 0 && i + 3 < argc) {
+        int pn = atoi(argv[i++]);
+        int kn = atoi(argv[i++]);
+        const char *field = argv[i++];
+        const char *val = argv[i];
+        printf("Modifying keygroup %d:%d: %s = %s\n", pn, kn, field, val);
+        result = s3k_modify_keygroup(&client, pn, kn, field, val);
+        if (result == 0) {
+            printf("OK — verifying:\n");
+            usleep(500000);
+            cmd_keygroup_header(&client, pn, kn);
+        } else {
+            fprintf(stderr, "Modify failed (status=%d)\n", result);
+        }
+    }
+    else if (strcmp(cmd, "misc-data") == 0) {
+        uint8_t rx[S3K_MAX_RESPONSE];
+        size_t rx_len = sizeof(rx);
+        result = s3k_command(&client, OP_RMDATA, nullptr, 0, rx, &rx_len);
+        if (result == 0 && rx_len >= 4) {
+            /* Nibblized misc data — decode key fields */
+            int off = 0;
+            uint8_t bmchan = read_nibble_byte(rx, &off);
+            uint8_t omni = read_nibble_byte(rx, &off);
+            uint8_t psel = read_nibble_byte(rx, &off);
+            uint8_t selprog = read_nibble_byte(rx, &off);
+            printf("Miscellaneous Data:\n");
+            printf("  Basic MIDI channel: %d\n", bmchan + 1);
+            printf("  Omni mode:          %s\n", omni ? "ON" : "OFF");
+            printf("  Program select:     %s\n", psel ? "ON" : "OFF");
+            printf("  Selected program:   %d\n", selprog);
+            if (rx_len > 8) {
+                uint8_t exchan = read_nibble_byte(rx, &off);
+                printf("  Exclusive channel:  %d\n", exchan);
+            }
+            printf("  Raw (%zu nibbles):", rx_len);
+            for (size_t d = 0; d < rx_len && d < 40; d++) printf(" %02x", rx[d]);
+            if (rx_len > 40) printf(" ...");
+            printf("\n");
+        } else {
+            fprintf(stderr, "Failed to fetch misc data (status=%d)\n", result);
+        }
     }
     else if (strcmp(cmd, "clone-program") == 0 && i + 1 < argc) {
         int src = atoi(argv[i++]);
