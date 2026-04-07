@@ -41,8 +41,11 @@ static void usage(const char *prog) {
         "  program-header N     Show program header for program N\n"
         "  keygroup P K         Show keygroup K of program P\n"
         "  download-sample N [file.wav]  Download sample N as WAV\n"
-        "  status               Show device overview\n"
-        "  raw OPCODE [DATA...] Send raw Akai SysEx\n",
+        "  upload-sample N file.wav      Upload WAV to sample N\n"
+        "  delete-sample N               Delete sample N\n"
+        "  delete-program N              Delete program N\n"
+        "  status                        Show device overview\n"
+        "  raw OPCODE [DATA...]          Send raw Akai SysEx\n",
         prog);
 }
 
@@ -287,6 +290,49 @@ int main(int argc, char *argv[]) {
             s3k_write_wav(outpath, samples, count, hdr.sample_rate, 1);
             free(samples);
         }
+    }
+    else if (strcmp(cmd, "upload-sample") == 0 && i + 1 < argc) {
+        int sn = atoi(argv[i++]);
+        const char *wavpath = argv[i];
+        /* Read WAV file */
+        FILE *wf = fopen(wavpath, "rb");
+        if (!wf) { fprintf(stderr, "Cannot open %s\n", wavpath); result = 1; }
+        else {
+            uint8_t whdr[44];
+            if (fread(whdr, 1, 44, wf) != 44 || memcmp(whdr, "RIFF", 4) != 0) {
+                fprintf(stderr, "Not a valid WAV file\n"); result = 1;
+            } else {
+                int wav_rate = *(uint32_t *)(whdr + 24);
+                int wav_bits = *(uint16_t *)(whdr + 34);
+                int data_size = *(uint32_t *)(whdr + 40);
+                int wav_samples = data_size / (wav_bits / 8);
+                if (wav_bits != 16) {
+                    fprintf(stderr, "Only 16-bit WAV supported (got %d-bit)\n", wav_bits);
+                    result = 1;
+                } else {
+                    int16_t *pcm = (int16_t *)malloc(data_size);
+                    fread(pcm, 2, wav_samples, wf);
+                    printf("Uploading %s → sample %d (%d samples, %d Hz)\n",
+                        wavpath, sn, wav_samples, wav_rate);
+                    result = s3k_upload_sample(&client, sn, pcm, wav_samples, wav_rate);
+                    free(pcm);
+                    if (result == 0) printf("Upload complete.\n");
+                }
+            }
+            fclose(wf);
+        }
+    }
+    else if (strcmp(cmd, "delete-sample") == 0 && i < argc) {
+        int sn = atoi(argv[i]);
+        printf("Deleting sample %d...\n", sn);
+        result = s3k_delete_sample(&client, sn);
+        printf("%s\n", result == 0 ? "OK" : "Failed");
+    }
+    else if (strcmp(cmd, "delete-program") == 0 && i < argc) {
+        int pn = atoi(argv[i]);
+        printf("Deleting program %d...\n", pn);
+        result = s3k_delete_program(&client, pn);
+        printf("%s\n", result == 0 ? "OK" : "Failed");
     }
     else if (strcmp(cmd, "raw") == 0) result = cmd_raw(&client, argc - i, argv + i);
     else { fprintf(stderr, "Unknown command: %s\n", cmd); usage(argv[0]); result = 1; }
