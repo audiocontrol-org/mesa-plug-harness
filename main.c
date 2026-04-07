@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdint.h>
 #include "musashi/m68k.h"
+#include "scsi_bridge.h"
 
 /* ======================================================================== */
 /* Memory layout                                                             */
@@ -188,16 +189,72 @@ static void handle_aline_trap(unsigned int opcode) {
         }
 
         case 0xA089:  /* SCSIDispatch */
-            printf("  *** SCSI DISPATCH *** A0=PB@0x%08x\n", a0);
-            if (a0 && a0 + 32 < MEM_SIZE) {
-                printf("  PB dump:");
-                for (int i = 0; i < 32; i++)
-                    printf(" %02x", g_mem[a0 + i]);
-                printf("\n");
+        {
+            printf("  *** SCSI DISPATCH *** A0=PB@0x%08x D0=%d\n", a0, d0);
+            if (a0 && a0 + 0x50 < MEM_SIZE) {
+                /* Parse SCSI Manager 4.3 SCSIExecIO PB */
+                unsigned int func_code = g_mem[a0 + 8];
+                unsigned int bus = g_mem[a0 + 12] & 0xFF;  /* scsiDevice.bus at PB+12 */
+                unsigned int target = g_mem[a0 + 13] & 0xFF;
+                unsigned int lun = g_mem[a0 + 14] & 0xFF;
+                unsigned int flags = READ_BE32(g_mem, a0 + 20);
+                unsigned int data_ptr = READ_BE32(g_mem, a0 + 28);
+                unsigned int data_len = READ_BE32(g_mem, a0 + 32);
+                int cdb_len = g_mem[a0 + 58] ? g_mem[a0 + 58] : 6;
+                unsigned char cdb[16];
+                for (int i = 0; i < cdb_len && i < 16; i++)
+                    cdb[i] = g_mem[a0 + 42 + i];
+
+                printf("  func=%d bus=%d target=%d lun=%d flags=0x%08x\n",
+                    func_code, bus, target, lun, flags);
+                printf("  CDB[%d]:", cdb_len);
+                for (int i = 0; i < cdb_len; i++) printf(" %02x", cdb[i]);
+                printf("\n  data_ptr=0x%08x data_len=%d\n", data_ptr, data_len);
+
+                if (func_code == 1) {  /* SCSIExecIO — forward to scsi2pi */
+                    int is_write = (flags & 0x80000000) != 0;
+                    int is_read  = (flags & 0x40000000) != 0;
+
+                    uint8_t *out_buf = NULL;
+                    size_t out_len = 0;
+                    uint8_t *in_buf = NULL;
+                    size_t in_len = 0;
+
+                    if (is_write && data_ptr && data_len > 0 && data_ptr + data_len <= MEM_SIZE) {
+                        out_buf = &g_mem[data_ptr];
+                        out_len = data_len;
+                    }
+                    if (is_read && data_ptr && data_len > 0) {
+                        in_buf = (data_ptr + data_len <= MEM_SIZE) ? &g_mem[data_ptr] : NULL;
+                        in_len = data_len;
+                    }
+
+                    printf("  → Forwarding to scsi2pi (target %d, %s, %d bytes)\n",
+                        target, is_write ? "WRITE" : is_read ? "READ" : "NONE",
+                        is_write ? (int)out_len : (int)in_len);
+
+                    int status = scsi_bridge_exec(target, lun, cdb, cdb_len,
+                        out_buf, out_len, in_buf, &in_len, 10);
+
+                    printf("  ← SCSI status=%d, data_in=%zu bytes\n", status, in_len);
+                    if (is_read && in_len > 0) {
+                        printf("  ← Data:");
+                        for (size_t i = 0; i < in_len && i < 64; i++)
+                            printf(" %02x", in_buf ? in_buf[i] : 0);
+                        if (in_len > 64) printf(" ...");
+                        printf("\n");
+                    }
+
+                    /* Write result back to PB */
+                    WRITE_BE16(g_mem, a0 + 10, (status >= 0) ? 0 : 0xFFEC); /* scsiResult */
+                    WRITE_BE32(g_mem, a0 + 32, in_len); /* actual data length */
+                } else {
+                    printf("  (non-ExecIO func %d — returning noErr)\n", func_code);
+                }
             }
-            /* Return noErr for now — will forward to scsi2pi later */
             m68k_set_reg(M68K_REG_D0, 0);
             break;
+        }
 
         case 0xA89F:  /* SCSIAtomic: just return its address (different from _Unimplemented) */
         {
@@ -614,6 +671,9 @@ int main(int argc, char *argv[]) {
     if (load_plug(plug_path) < 0)
         return 1;
 
+    /* Initialize SCSI bridge to scsi2pi */
+    scsi_bridge_init("10.0.0.57", 6868);
+
     /* Initialize Musashi */
     m68k_init();
     m68k_set_cpu_type(M68K_CPU_TYPE_68040);
@@ -651,7 +711,7 @@ int main(int argc, char *argv[]) {
     g_mem[pb + 12] = 0;                   /* bus = 0 */
     g_mem[pb + 13] = 6;                   /* target = 6 */
     g_mem[pb + 14] = 0;                   /* lun = 0 */
-    WRITE_BE32(g_mem, pb + 20, 0x80000000); /* flags: read */
+    WRITE_BE32(g_mem, pb + 20, 0x40040000); /* flags: read (from SCSI-PROTOCOL.md) */
     WRITE_BE16(g_mem, pb + 24, 1000);     /* timeout = 1000 */
     WRITE_BE32(g_mem, pb + 28, inq_buf);  /* dataPtr */
     WRITE_BE32(g_mem, pb + 32, 96);       /* dataLength = 96 */

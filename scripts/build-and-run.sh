@@ -12,7 +12,7 @@ make -j4 2>&1 | grep -E "^(gcc -o|error|warning:.*main\.c)" || true
 echo ""
 
 echo "=== Running (10s timeout) ==="
-perl -e 'alarm 10; exec @ARGV' ./plug-harness "$PLUG_BIN" 2>&1
+perl -e 'alarm 30; exec @ARGV' ./mesa-plug-harness "$PLUG_BIN" 2>&1
 EXIT=$?
 echo ""
 echo "Exit code: $EXIT"
