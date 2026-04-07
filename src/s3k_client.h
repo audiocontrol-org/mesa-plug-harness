@@ -49,6 +49,16 @@ int s3k_list_programs(S3kClient *c, char names[][S3K_NAME_LEN], int max);
 /* Fetch sample header for sample N. Returns 0 on success. */
 int s3k_fetch_sample_header(S3kClient *c, int sample_num, S3kSampleHeader *hdr);
 
+/* Download sample audio data via RSPACK/SDS.
+ * Allocates and returns 16-bit PCM samples. Caller must free().
+ * Returns number of samples (negative on error). */
+int s3k_download_sample(S3kClient *c, int sample_num,
+                        int16_t **samples_out, S3kSampleHeader *hdr_out);
+
+/* Write 16-bit PCM samples to a WAV file. Returns 0 on success. */
+int s3k_write_wav(const char *path, const int16_t *samples, int num_samples,
+                  int sample_rate, int channels);
+
 /* Send a raw Akai SysEx command. Returns response payload length (negative on error). */
 int s3k_command(S3kClient *c, AkaiOpcode op, const uint8_t *data, size_t data_len,
                 uint8_t *response, size_t *response_len);

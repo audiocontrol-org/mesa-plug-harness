@@ -38,6 +38,7 @@ static void usage(const char *prog) {
         "  list-samples         List resident sample names\n"
         "  list-programs        List resident program names\n"
         "  sample-header N      Show sample header for sample N\n"
+        "  download-sample N [file.wav]  Download sample N as WAV\n"
         "  raw OPCODE [DATA...] Send raw Akai SysEx\n",
         prog);
 }
@@ -183,6 +184,26 @@ int main(int argc, char *argv[]) {
     else if (strcmp(cmd, "list-programs") == 0) result = cmd_list(&client, "programs");
     else if (strcmp(cmd, "sample-header") == 0 && i < argc)
         result = cmd_sample_header(&client, atoi(argv[i]));
+    else if (strcmp(cmd, "download-sample") == 0 && i < argc) {
+        int sn = atoi(argv[i++]);
+        const char *outpath = (i < argc) ? argv[i] : nullptr;
+        int16_t *samples = nullptr;
+        S3kSampleHeader hdr;
+        int count = s3k_download_sample(&client, sn, &samples, &hdr);
+        if (count <= 0) {
+            fprintf(stderr, "Download failed (error=%d)\n", count);
+            result = 1;
+        } else {
+            printf("Downloaded %d samples from \"%s\" (%u Hz)\n", count, hdr.name, hdr.sample_rate);
+            char default_path[64];
+            if (!outpath) {
+                snprintf(default_path, sizeof(default_path), "sample_%d.wav", sn);
+                outpath = default_path;
+            }
+            s3k_write_wav(outpath, samples, count, hdr.sample_rate, 1);
+            free(samples);
+        }
+    }
     else if (strcmp(cmd, "raw") == 0) result = cmd_raw(&client, argc - i, argv + i);
     else { fprintf(stderr, "Unknown command: %s\n", cmd); usage(argv[0]); result = 1; }
 
