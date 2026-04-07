@@ -49,7 +49,7 @@ static void usage(const char *prog) {
         "  download-sample N [file.wav]  Download sample N as WAV\n"
         "  upload-sample N file.wav      Upload WAV to sample N\n"
         "  delete-sample N               Delete sample N\n"
-        "  clone-program SRC DST         Clone program SRC to slot DST\n"
+        "  clone-program SRC DST [NAME]  Clone program SRC to slot DST with optional new name\n"
         "  delete-program N              Delete program N\n"
         "  status                        Show device overview\n"
         "  raw OPCODE [DATA...]          Send raw Akai SysEx\n",
@@ -392,10 +392,12 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Failed to fetch misc data (status=%d)\n", result);
         }
     }
-    else if (strcmp(cmd, "clone-program") == 0 && i + 1 < argc) {
+    else if (strcmp(cmd, "clone-program") == 0 && i + 2 < argc) {
         int src = atoi(argv[i++]);
-        int dst = atoi(argv[i]);
-        printf("Cloning program %d → %d\n", src, dst);
+        int dst = atoi(argv[i++]);
+        const char *new_name = (i < argc) ? argv[i] : nullptr;
+        printf("Cloning program %d → %d%s%s%s\n", src, dst,
+            new_name ? " as \"" : "", new_name ? new_name : "", new_name ? "\"" : "");
         /* Fetch raw SysEx for source program */
         uint8_t raw[S3K_MAX_RESPONSE];
         size_t raw_len = sizeof(raw);
@@ -411,6 +413,15 @@ int main(int argc, char *argv[]) {
             byte_to_nibbles(dst & 0xFF, dst_nib);
             raw[5] = dst_nib[0];
             raw[6] = dst_nib[1];
+            /* Patch name if provided (PRNAME at reloff=3 → nibble offset 2+3*2=8 from payload) */
+            if (new_name) {
+                uint8_t *payload = raw + SYSEX_HEADER_SIZE;
+                int noff = 2 + 3 * 2; /* PROG_FIELD_NIB(3) */
+                char padded[13] = "            ";
+                strncpy(padded, new_name, 12);
+                for (int ci = 0; ci < 12; ci++)
+                    write_nibble_byte(payload, &noff, ascii_to_akai(padded[ci]));
+            }
             /* Send as PDATA (write) — strip SysEx envelope */
             result = s3k_write_program_header(&client, dst, raw, raw_len);
             printf("  PDATA write: %s\n", result == 0 ? "OK" : "FAILED");
