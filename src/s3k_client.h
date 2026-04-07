@@ -92,6 +92,32 @@ int s3k_download_sample(S3kClient *c, int sample_num,
 int s3k_write_wav(const char *path, const int16_t *samples, int num_samples,
                   int sample_rate, int channels);
 
+/* Write a program header back to the device. Returns 0 on success. */
+int s3k_write_program_header(S3kClient *c, int program_num, const uint8_t *raw, size_t raw_len);
+
+/* Write a sample header back to the device. Returns 0 on success. */
+int s3k_write_sample_header(S3kClient *c, int sample_num, const uint8_t *raw, size_t raw_len);
+
+/* Write a keygroup header back to the device. Returns 0 on success. */
+int s3k_write_keygroup_header(S3kClient *c, int program_num, int keygroup_num,
+                               const uint8_t *raw, size_t raw_len);
+
+/* Delete a program. Returns 0 on success. */
+int s3k_delete_program(S3kClient *c, int program_num);
+
+/* Delete a sample. Returns 0 on success. */
+int s3k_delete_sample(S3kClient *c, int sample_num);
+
+/* Upload sample audio data via SDS.
+ * Returns 0 on success. */
+int s3k_upload_sample(S3kClient *c, int sample_num, const int16_t *samples,
+                      int num_samples, int sample_rate);
+
+/* Fetch raw SysEx response (for read-modify-write operations).
+ * Returns response length (negative on error). */
+int s3k_fetch_raw(S3kClient *c, AkaiOpcode op, int item_num,
+                  uint8_t *response, size_t *response_len);
+
 /* Send a raw Akai SysEx command. Returns response payload length (negative on error). */
 int s3k_command(S3kClient *c, AkaiOpcode op, const uint8_t *data, size_t data_len,
                 uint8_t *response, size_t *response_len);

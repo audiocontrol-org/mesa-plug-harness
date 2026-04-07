@@ -160,14 +160,13 @@ int s3k_fetch_program_header(S3kClient *c, int program_num, S3kProgramHeader *hd
     NEED(2); hdr->output = read_nibble_byte(payload, &off);          /* OUTPUT (1) */
     NEED(2); read_nibble_byte(payload, &off);                        /* STEREO (1) — skip */
     NEED(2); hdr->pan = (int8_t)read_nibble_byte(payload, &off);    /* PANPOS (1, signed) */
-    NEED(2); hdr->loudness = read_nibble_byte(payload, &off);        /* PRLOUD (1) */
+    NEED(2); hdr->loudness = read_nibble_byte(payload, &off);        /* PRLOUD (1) off=25 */
 
-    /* Skip to GROUPS: fields 25-36 are LFO, velocity, etc. = 13 bytes */
-    int skip_to_groups = 13;
-    if (off + skip_to_groups * 2 <= (int)payload_len) {
-        off += skip_to_groups * 2;
-        NEED(2); hdr->num_keygroups = read_nibble_byte(payload, &off); /* GROUPS (1) */
-    }
+    /* Skip V_LOUD(1) K_LOUD(1) P_LOUD(1) PANRAT(1) PANDEP(1) PANDEL(1)
+     * K_PANP(1) LFORAT(1) LFODEP(1) LFODEL(1) MWLDEP(1) PRSDEP(1) VELDEP(1)
+     * B_PTCH(1) P_PTCH(1) KXFADE(1) = 16 bytes to reach GROUPS at off=42 */
+    NEED(32); off += 32; /* 16 bytes = 32 nibbles */
+    NEED(2); hdr->num_keygroups = read_nibble_byte(payload, &off);  /* GROUPS (1) off=42 */
 
 #undef NEED
     return 0;
@@ -195,56 +194,69 @@ int s3k_fetch_keygroup_header(S3kClient *c, int program_num, int keygroup_num,
     if (op != OP_KDATA) return -5;
 
     /* Payload: program_number (2 nibbles) + keygroup_number (1 raw byte) + nibblized data.
-     * The KNUMBER is NOT nibblized — it's a single raw byte. */
+     * The KNUMBER is NOT nibblized — it's a single raw byte at payload[2]. */
     int off = 3; /* 2 nibbles for program + 1 raw byte for keygroup */
     memset(hdr, 0, sizeof(*hdr));
 
+    /* Field offsets from S2800 spec (byte offsets within nibblized data):
+     * 0:KGIDENT(1) 1:NXTKG(2) 3:LONOTE(1) 4:HINOTE(1) 5:KGTUNO(2) 7:FILFRQ(1)
+     * ...envelope/mod fields...
+     * 34:SNAME1(12) 46:LOVEL1(1) 47:HIVEL1(1) ...zone1 fields(10)...
+     * 58:SNAME2(12) 70:LOVEL2(1) 71:HIVEL2(1) ...
+     * 82:SNAME3(12) 94:LOVEL3(1) 95:HIVEL3(1) ...
+     * 106:SNAME4(12) 118:LOVEL4(1) 119:HIVEL4(1) ... */
+
 #define NEED(n) if (off + (n) > (int)payload_len) return 0
+#define SKIP_BYTES(n) off += (n) * 2
 
-    NEED(2); read_nibble_byte(payload, &off);                        /* KGIDENT (1) — skip */
-    NEED(4); read_nibble_u16(payload, &off);                         /* NXTKG (2) — skip */
-    NEED(2); hdr->lo_note = read_nibble_byte(payload, &off);        /* LONOTE (1) */
-    NEED(2); hdr->hi_note = read_nibble_byte(payload, &off);        /* HINOTE (1) */
+    NEED(2); read_nibble_byte(payload, &off);                        /* KGIDENT (1) off=0 */
+    NEED(4); read_nibble_u16(payload, &off);                         /* NXTKG (2) off=1 */
+    NEED(2); hdr->lo_note = read_nibble_byte(payload, &off);        /* LONOTE (1) off=3 */
+    NEED(2); hdr->hi_note = read_nibble_byte(payload, &off);        /* HINOTE (1) off=4 */
+    NEED(4); read_nibble_u16(payload, &off);                         /* KGTUNO (2) off=5 */
+    NEED(2); hdr->filter_freq = read_nibble_byte(payload, &off);    /* FILFRQ (1) off=7 */
 
-    /* Skip to FILFRQ: OKTUNO(2) + KXFLT(1) + KXFLA(1) + ATTAK(1) + DECAY(1) +
-     *   SUSTN(1) + RELSE(1) + AVELO(1) + ARELO(1) = 10 bytes */
-    if (off + 20 <= (int)payload_len) off += 20;
+    /* Skip from off=8 to zone 1 SNAME at off=34: 26 bytes of envelope/mod fields */
+    NEED(52); SKIP_BYTES(26);
 
-    NEED(2); hdr->filter_freq = read_nibble_byte(payload, &off);    /* FILFRQ (1) */
-
-    /* Skip to velocity zone 1 sample name: many envelope/modulation fields.
-     * The exact offset depends on the S3000XL version. We'll read from the
-     * known position relative to the start. Zone 1 starts at byte offset ~58. */
-    /* For robustness, scan forward to find sample names from LONOTE position.
-     * Zone sample names are at fixed offsets in the keygroup:
-     * Zone 1 SNAME at byte 59, Zone 2 at 78, Zone 3 at 97, Zone 4 at 116.
-     * Each zone block is 19 bytes. */
-    int zone_base = 3 + 59 * 2; /* nibble offset for zone 1 sample name */
-    if (zone_base + 24 <= (int)payload_len) {
-        int zoff = zone_base;
+    /* Zone 1: SNAME1(12) LOVEL1(1) HIVEL1(1) + 10 more bytes = 24 total */
+    NEED(24); {
         uint8_t n[12];
-        for (int i = 0; i < 12; i++) n[i] = read_nibble_byte(payload, &zoff);
+        for (int i = 0; i < 12; i++) n[i] = read_nibble_byte(payload, &off); /* off=34 */
         akai_decode_name(n, 12, hdr->zone1_sample);
+    }
+    NEED(2); hdr->zone1_lo_vel = read_nibble_byte(payload, &off);  /* LOVEL1 off=46 */
+    NEED(2); hdr->zone1_hi_vel = read_nibble_byte(payload, &off);  /* HIVEL1 off=47 */
+    NEED(20); SKIP_BYTES(10); /* rest of zone 1: VTUNO1(2)+VLOUD1(1)+...+SBADD1(2) = 10 */
 
-        /* Zone 1 velocity range: LOVEL at zone+12, HIVEL at zone+13 */
-        int vel_off = zone_base + 12 * 2;
-        if (vel_off + 4 <= (int)payload_len) {
-            hdr->zone1_lo_vel = read_nibble_byte(payload, &vel_off);
-            hdr->zone1_hi_vel = read_nibble_byte(payload, &vel_off);
-        }
+    /* Zone 2: SNAME2(12) at off=58 */
+    NEED(24); {
+        uint8_t n[12];
+        for (int i = 0; i < 12; i++) n[i] = read_nibble_byte(payload, &off);
+        akai_decode_name(n, 12, hdr->zone2_sample);
     }
-    /* Zone 2-4 sample names (19-byte stride) */
-    for (int z = 1; z < 4; z++) {
-        int zoff = zone_base + z * 19 * 2;
-        char (*dest)[S3K_NAME_LEN] = (z == 1) ? &hdr->zone2_sample :
-                                      (z == 2) ? &hdr->zone3_sample :
-                                                  &hdr->zone4_sample;
-        if (zoff + 24 <= (int)payload_len) {
-            uint8_t n[12];
-            for (int i = 0; i < 12; i++) n[i] = read_nibble_byte(payload, &zoff);
-            akai_decode_name(n, 12, *dest);
-        }
+    NEED(2); read_nibble_byte(payload, &off); /* LOVEL2 */
+    NEED(2); read_nibble_byte(payload, &off); /* HIVEL2 */
+    NEED(20); SKIP_BYTES(10);
+
+    /* Zone 3: SNAME3(12) at off=82 */
+    NEED(24); {
+        uint8_t n[12];
+        for (int i = 0; i < 12; i++) n[i] = read_nibble_byte(payload, &off);
+        akai_decode_name(n, 12, hdr->zone3_sample);
     }
+    NEED(2); read_nibble_byte(payload, &off);
+    NEED(2); read_nibble_byte(payload, &off);
+    NEED(20); SKIP_BYTES(10);
+
+    /* Zone 4: SNAME4(12) at off=106 */
+    NEED(24); {
+        uint8_t n[12];
+        for (int i = 0; i < 12; i++) n[i] = read_nibble_byte(payload, &off);
+        akai_decode_name(n, 12, hdr->zone4_sample);
+    }
+
+#undef SKIP_BYTES
 
 #undef NEED
     return 0;
@@ -496,6 +508,182 @@ int s3k_write_wav(const char *path, const int16_t *samples, int num_samples,
 
     fprintf(stderr, "Wrote %s (%d samples, %d Hz, %d bytes)\n",
         path, num_samples, sample_rate, file_size);
+    return 0;
+}
+
+/* ---- Write operations ---- */
+
+/* Send a write command and check for REPLY OK */
+static int s3k_write(S3kClient *c, AkaiOpcode op, const uint8_t *data, size_t data_len) {
+    uint8_t rx[S3K_MAX_RESPONSE];
+    size_t rx_len = sizeof(rx);
+
+    int status = s3k_exchange(c, op, data, data_len, rx, &rx_len);
+    if (status != 0) return status;
+
+    /* Check for REPLY (0x16) response */
+    AkaiOpcode resp_op;
+    const uint8_t *payload;
+    size_t payload_len;
+    if (akai_parse_response(rx, rx_len, &resp_op, &payload, &payload_len)) {
+        if (resp_op == OP_REPLY && payload_len > 0 && payload[0] != 0)
+            return -(int)payload[0]; /* Error code */
+    }
+    return 0;
+}
+
+int s3k_fetch_raw(S3kClient *c, AkaiOpcode op, int item_num,
+                  uint8_t *response, size_t *response_len)
+{
+    uint8_t req_data[2];
+    byte_to_nibbles(item_num & 0xFF, req_data);
+    return s3k_exchange(c, op, req_data, 2, response, response_len);
+}
+
+int s3k_write_program_header(S3kClient *c, int program_num,
+                              const uint8_t *raw, size_t raw_len)
+{
+    /* raw is the full SysEx response from RPDATA. Strip the envelope
+     * (5-byte header + F7) and send the payload via PDATA. */
+    if (raw_len < 7) return -1;
+    const uint8_t *payload = raw + SYSEX_HEADER_SIZE;
+    size_t payload_len = raw_len - SYSEX_HEADER_SIZE - 1;
+    return s3k_write(c, OP_PDATA, payload, payload_len);
+}
+
+int s3k_write_sample_header(S3kClient *c, int sample_num,
+                             const uint8_t *raw, size_t raw_len)
+{
+    if (raw_len < 7) return -1;
+    const uint8_t *payload = raw + SYSEX_HEADER_SIZE;
+    size_t payload_len = raw_len - SYSEX_HEADER_SIZE - 1;
+    return s3k_write(c, OP_SDATA, payload, payload_len);
+}
+
+int s3k_write_keygroup_header(S3kClient *c, int program_num, int keygroup_num,
+                               const uint8_t *raw, size_t raw_len)
+{
+    if (raw_len < 7) return -1;
+    const uint8_t *payload = raw + SYSEX_HEADER_SIZE;
+    size_t payload_len = raw_len - SYSEX_HEADER_SIZE - 1;
+    return s3k_write(c, OP_KDATA, payload, payload_len);
+}
+
+int s3k_delete_program(S3kClient *c, int program_num) {
+    uint8_t data[2];
+    byte_to_nibbles(program_num & 0xFF, data);
+    return s3k_write(c, OP_DELP, data, 2);
+}
+
+int s3k_delete_sample(S3kClient *c, int sample_num) {
+    uint8_t data[2];
+    byte_to_nibbles(sample_num & 0xFF, data);
+    return s3k_write(c, OP_DELS, data, 2);
+}
+
+/* ---- SDS Upload ---- */
+
+static void sds_encode_sample_16(int16_t sample, uint8_t out[3]) {
+    uint16_t raw = (uint16_t)sample;
+    out[0] = (raw >> 9) & 0x7F;
+    out[1] = (raw >> 2) & 0x7F;
+    out[2] = (raw << 5) & 0x60;
+}
+
+int s3k_upload_sample(S3kClient *c, int sample_num, const int16_t *samples,
+                      int num_samples, int sample_rate)
+{
+    /* Build SDS Dump Header:
+     * F0 7E ch 01 nn nn ff pp pp pp pp ll ll ll ll ls ls ls ls le le le le lt F7 */
+    uint8_t hdr[21 + 2]; /* header bytes + F0 + F7 */
+    int h = 0;
+    hdr[h++] = 0xF0;
+    hdr[h++] = 0x7E;
+    hdr[h++] = c->channel;
+    hdr[h++] = 0x01; /* Dump Header */
+    hdr[h++] = sample_num & 0x7F;
+    hdr[h++] = (sample_num >> 7) & 0x7F;
+    hdr[h++] = 16; /* bits per sample */
+    /* Sample period in nanoseconds (3 bytes, 7-bit each) */
+    uint32_t period_ns = (uint32_t)(1000000000.0 / sample_rate);
+    hdr[h++] = period_ns & 0x7F;
+    hdr[h++] = (period_ns >> 7) & 0x7F;
+    hdr[h++] = (period_ns >> 14) & 0x7F;
+    /* Sample length (3 bytes, 7-bit) */
+    hdr[h++] = num_samples & 0x7F;
+    hdr[h++] = (num_samples >> 7) & 0x7F;
+    hdr[h++] = (num_samples >> 14) & 0x7F;
+    /* Loop start = 0 */
+    hdr[h++] = 0; hdr[h++] = 0; hdr[h++] = 0;
+    /* Loop end = 0 */
+    hdr[h++] = 0; hdr[h++] = 0; hdr[h++] = 0;
+    /* Loop type = 0 (off) */
+    hdr[h++] = 0;
+    hdr[h++] = 0xF7;
+
+    fprintf(stderr, "Uploading sample %d: %d samples @ %d Hz\n",
+        sample_num, num_samples, sample_rate);
+
+    /* Send dump header */
+    int status = scsi_midi_send(&c->midi, hdr, h);
+    usleep(200000);
+
+    /* Wait for ACK */
+    uint8_t rx[256];
+    size_t rx_len = sizeof(rx);
+    status = scsi_midi_receive(&c->midi, rx, &rx_len, 30);
+    if (status != 0) {
+        fprintf(stderr, "  No ACK for dump header (status=%d)\n", status);
+        return -1;
+    }
+
+    /* Send data packets: 40 samples per packet (120 bytes at 3 bytes/sample) */
+    int pkt_num = 0;
+    int offset = 0;
+    while (offset < num_samples) {
+        uint8_t pkt[128];
+        int p = 0;
+        pkt[p++] = 0xF0;
+        pkt[p++] = 0x7E;
+        pkt[p++] = c->channel;
+        pkt[p++] = 0x02; /* Data Packet */
+        pkt[p++] = pkt_num & 0x7F;
+
+        /* Encode 40 samples (or fewer for last packet) */
+        uint8_t checksum = pkt[1] ^ pkt[2] ^ pkt[3] ^ pkt[4];
+        for (int i = 0; i < 40; i++) {
+            uint8_t enc[3];
+            int16_t s = (offset + i < num_samples) ? samples[offset + i] : 0;
+            sds_encode_sample_16(s, enc);
+            pkt[p++] = enc[0]; checksum ^= enc[0];
+            pkt[p++] = enc[1]; checksum ^= enc[1];
+            pkt[p++] = enc[2]; checksum ^= enc[2];
+        }
+        pkt[p++] = checksum & 0x7F;
+        pkt[p++] = 0xF7;
+
+        status = scsi_midi_send(&c->midi, pkt, p);
+        usleep(50000);
+
+        /* Wait for ACK */
+        rx_len = sizeof(rx);
+        status = scsi_midi_receive(&c->midi, rx, &rx_len, 15);
+        if (status != 0) {
+            fprintf(stderr, "\n  No ACK for packet %d (status=%d)\n", pkt_num, status);
+            return -2;
+        }
+
+        offset += 40;
+        pkt_num = (pkt_num + 1) & 0x7F;
+
+        if ((pkt_num % 16) == 0 || offset >= num_samples)
+            fprintf(stderr, "  Packet %d: %d/%d samples\r", pkt_num, offset < num_samples ? offset : num_samples, num_samples);
+    }
+    fprintf(stderr, "\n  Upload complete\n");
+
+    /* Wait for device to commit */
+    usleep(3000000); /* 3 seconds per audiocontrol convention */
+
     return 0;
 }
 
