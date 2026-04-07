@@ -28,6 +28,32 @@ struct S3kSampleHeader {
     uint8_t play_type;     /* 0=loop, 1=loop-release, 2=no-loop, 3=play-to-end */
 };
 
+struct S3kProgramHeader {
+    char name[S3K_NAME_LEN];
+    uint8_t midi_program;  /* MIDI program number (0-128) */
+    uint8_t midi_channel;  /* MIDI channel (0-15, 255=OMNI) */
+    uint8_t num_keygroups; /* Number of keygroups */
+    uint8_t polyphony;     /* Polyphony (0-31 = 1-32 voices) */
+    uint8_t play_lo;       /* Play range low (MIDI note) */
+    uint8_t play_hi;       /* Play range high */
+    uint8_t priority;      /* 0=low, 1=norm, 2=high, 3=hold */
+    uint8_t output;        /* Individual output routing */
+    int8_t  pan;           /* Pan (-50 to +50) */
+    uint8_t loudness;      /* Program loudness (0-99) */
+};
+
+struct S3kKeygroupHeader {
+    uint8_t lo_note;       /* Key range low (MIDI note) */
+    uint8_t hi_note;       /* Key range high */
+    uint8_t filter_freq;   /* Filter frequency (0-99) */
+    char zone1_sample[S3K_NAME_LEN]; /* Velocity zone 1 sample name */
+    char zone2_sample[S3K_NAME_LEN]; /* Velocity zone 2 sample name */
+    char zone3_sample[S3K_NAME_LEN]; /* Velocity zone 3 sample name */
+    char zone4_sample[S3K_NAME_LEN]; /* Velocity zone 4 sample name */
+    uint8_t zone1_lo_vel;  /* Zone 1 velocity range low */
+    uint8_t zone1_hi_vel;  /* Zone 1 velocity range high */
+};
+
 struct S3kClient {
     ScsiMidi midi;
     uint8_t channel;
@@ -48,6 +74,13 @@ int s3k_list_programs(S3kClient *c, char names[][S3K_NAME_LEN], int max);
 
 /* Fetch sample header for sample N. Returns 0 on success. */
 int s3k_fetch_sample_header(S3kClient *c, int sample_num, S3kSampleHeader *hdr);
+
+/* Fetch program header for program N. Returns 0 on success. */
+int s3k_fetch_program_header(S3kClient *c, int program_num, S3kProgramHeader *hdr);
+
+/* Fetch keygroup header. Returns 0 on success. */
+int s3k_fetch_keygroup_header(S3kClient *c, int program_num, int keygroup_num,
+                               S3kKeygroupHeader *hdr);
 
 /* Download sample audio data via RSPACK/SDS.
  * Allocates and returns 16-bit PCM samples. Caller must free().

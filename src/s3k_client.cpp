@@ -34,10 +34,32 @@ void s3k_close(S3kClient *c) {
 }
 
 /* Internal: send an Akai SysEx and receive the response */
+/* Drain any pending MIDI data from the device (e.g., leftover SDS packets) */
+static void s3k_drain(S3kClient *c) {
+    uint8_t junk[4096];
+    for (int i = 0; i < 200; i++) {
+        uint8_t pcdb[6] = {0x0D, 0, 0, 0, 0, 0};
+        uint8_t pb[3] = {0};
+        size_t plen = 3;
+        scsi_bridge_exec(c->midi.target_id, 0, pcdb, 6, NULL, 0, pb, &plen, 5);
+        uint32_t avail = 0;
+        if (plen >= 3) avail = ((uint32_t)pb[0]<<16)|((uint32_t)pb[1]<<8)|pb[2];
+        if (avail == 0) break;
+        /* Read and discard */
+        size_t rlen = (avail < sizeof(junk)) ? avail : sizeof(junk);
+        uint8_t rcdb[6] = {0x0E, 0, (uint8_t)((rlen>>16)&0xFF),
+                           (uint8_t)((rlen>>8)&0xFF), (uint8_t)(rlen&0xFF), 0};
+        scsi_bridge_exec(c->midi.target_id, 0, rcdb, 6, NULL, 0, junk, &rlen, 5);
+    }
+}
+
 static int s3k_exchange(S3kClient *c, AkaiOpcode op,
                         const uint8_t *data, size_t data_len,
                         uint8_t *rx_buf, size_t *rx_len)
 {
+    /* Drain any leftover data (e.g., SDS packets from a previous transfer) */
+    s3k_drain(c);
+
     auto msg = akai_build_sysex(c->channel, op, data, data_len);
 
     /* Send SysEx — ignore CHECK CONDITION, the device often returns
@@ -90,6 +112,142 @@ int s3k_list_programs(S3kClient *c, char names[][S3K_NAME_LEN], int max) {
     if (op != OP_PLIST) return -4;
 
     return akai_parse_name_list(payload, payload_len, names, max);
+}
+
+int s3k_fetch_program_header(S3kClient *c, int program_num, S3kProgramHeader *hdr) {
+    uint8_t req_data[2];
+    byte_to_nibbles(program_num & 0xFF, req_data);
+
+    uint8_t rx[S3K_MAX_RESPONSE];
+    size_t rx_len = sizeof(rx);
+    int status = s3k_exchange(c, OP_RPDATA, req_data, 2, rx, &rx_len);
+    if (status != 0) return -1;
+    if (rx_len < 6) return -2;
+
+    AkaiOpcode op;
+    const uint8_t *payload;
+    size_t payload_len;
+    if (!akai_parse_response(rx, rx_len, &op, &payload, &payload_len))
+        return -3;
+    if (op == OP_REPLY) return -4;
+    if (op != OP_PDATA) return -5;
+
+    /* Payload: program_number (2 nibbles) + nibblized header data.
+     * Field layout from S2800 SysEx spec (byte offsets, each = 2 nibbles): */
+    /* Skip: program_number_lo (1 nibble), program_number_hi (1 nibble),
+     * then 1 extra preamble byte (2 nibbles) per audiocontrol's offset=1 pattern */
+    int off = 4;
+    memset(hdr, 0, sizeof(*hdr));
+
+#define NEED(n) if (off + (n) > (int)payload_len) return 0 /* partial parse OK */
+
+    NEED(4); read_nibble_u16(payload, &off);                        /* KGRP1 (2) — skip */
+
+    /* PRNAME (12 bytes = 24 nibbles) */
+    NEED(24);
+    uint8_t name_raw[12];
+    for (int i = 0; i < 12; i++)
+        name_raw[i] = read_nibble_byte(payload, &off);
+    akai_decode_name(name_raw, 12, hdr->name);
+
+    NEED(2); hdr->midi_program = read_nibble_byte(payload, &off);   /* PRGNUM (1) */
+    NEED(2); hdr->midi_channel = read_nibble_byte(payload, &off);   /* PMCHAN (1) */
+    NEED(2); hdr->polyphony = read_nibble_byte(payload, &off);      /* POLYPH (1) */
+    NEED(2); hdr->priority = read_nibble_byte(payload, &off);       /* PRIORT (1) */
+    NEED(2); hdr->play_lo = read_nibble_byte(payload, &off);        /* PLAYLO (1) */
+    NEED(2); hdr->play_hi = read_nibble_byte(payload, &off);        /* PLAYHI (1) */
+    NEED(2); read_nibble_byte(payload, &off);                        /* OSHIFT (1) — skip */
+    NEED(2); hdr->output = read_nibble_byte(payload, &off);          /* OUTPUT (1) */
+    NEED(2); read_nibble_byte(payload, &off);                        /* STEREO (1) — skip */
+    NEED(2); hdr->pan = (int8_t)read_nibble_byte(payload, &off);    /* PANPOS (1, signed) */
+    NEED(2); hdr->loudness = read_nibble_byte(payload, &off);        /* PRLOUD (1) */
+
+    /* Skip to GROUPS: fields 25-36 are LFO, velocity, etc. = 13 bytes */
+    int skip_to_groups = 13;
+    if (off + skip_to_groups * 2 <= (int)payload_len) {
+        off += skip_to_groups * 2;
+        NEED(2); hdr->num_keygroups = read_nibble_byte(payload, &off); /* GROUPS (1) */
+    }
+
+#undef NEED
+    return 0;
+}
+
+int s3k_fetch_keygroup_header(S3kClient *c, int program_num, int keygroup_num,
+                               S3kKeygroupHeader *hdr) {
+    /* Request: RKDATA with program number (2 nibbles) + keygroup number (1 raw byte) */
+    uint8_t req_data[3];
+    byte_to_nibbles(program_num & 0xFF, req_data);
+    req_data[2] = keygroup_num;
+
+    uint8_t rx[S3K_MAX_RESPONSE];
+    size_t rx_len = sizeof(rx);
+    int status = s3k_exchange(c, OP_RKDATA, req_data, 3, rx, &rx_len);
+    if (status != 0) return -1;
+    if (rx_len < 6) return -2;
+
+    AkaiOpcode op;
+    const uint8_t *payload;
+    size_t payload_len;
+    if (!akai_parse_response(rx, rx_len, &op, &payload, &payload_len))
+        return -3;
+    if (op == OP_REPLY) return -4;
+    if (op != OP_KDATA) return -5;
+
+    /* Payload: program_number (2 nibbles) + keygroup_number (1 raw byte) + nibblized data.
+     * The KNUMBER is NOT nibblized — it's a single raw byte. */
+    int off = 3; /* 2 nibbles for program + 1 raw byte for keygroup */
+    memset(hdr, 0, sizeof(*hdr));
+
+#define NEED(n) if (off + (n) > (int)payload_len) return 0
+
+    NEED(2); read_nibble_byte(payload, &off);                        /* KGIDENT (1) — skip */
+    NEED(4); read_nibble_u16(payload, &off);                         /* NXTKG (2) — skip */
+    NEED(2); hdr->lo_note = read_nibble_byte(payload, &off);        /* LONOTE (1) */
+    NEED(2); hdr->hi_note = read_nibble_byte(payload, &off);        /* HINOTE (1) */
+
+    /* Skip to FILFRQ: OKTUNO(2) + KXFLT(1) + KXFLA(1) + ATTAK(1) + DECAY(1) +
+     *   SUSTN(1) + RELSE(1) + AVELO(1) + ARELO(1) = 10 bytes */
+    if (off + 20 <= (int)payload_len) off += 20;
+
+    NEED(2); hdr->filter_freq = read_nibble_byte(payload, &off);    /* FILFRQ (1) */
+
+    /* Skip to velocity zone 1 sample name: many envelope/modulation fields.
+     * The exact offset depends on the S3000XL version. We'll read from the
+     * known position relative to the start. Zone 1 starts at byte offset ~58. */
+    /* For robustness, scan forward to find sample names from LONOTE position.
+     * Zone sample names are at fixed offsets in the keygroup:
+     * Zone 1 SNAME at byte 59, Zone 2 at 78, Zone 3 at 97, Zone 4 at 116.
+     * Each zone block is 19 bytes. */
+    int zone_base = 3 + 59 * 2; /* nibble offset for zone 1 sample name */
+    if (zone_base + 24 <= (int)payload_len) {
+        int zoff = zone_base;
+        uint8_t n[12];
+        for (int i = 0; i < 12; i++) n[i] = read_nibble_byte(payload, &zoff);
+        akai_decode_name(n, 12, hdr->zone1_sample);
+
+        /* Zone 1 velocity range: LOVEL at zone+12, HIVEL at zone+13 */
+        int vel_off = zone_base + 12 * 2;
+        if (vel_off + 4 <= (int)payload_len) {
+            hdr->zone1_lo_vel = read_nibble_byte(payload, &vel_off);
+            hdr->zone1_hi_vel = read_nibble_byte(payload, &vel_off);
+        }
+    }
+    /* Zone 2-4 sample names (19-byte stride) */
+    for (int z = 1; z < 4; z++) {
+        int zoff = zone_base + z * 19 * 2;
+        char (*dest)[S3K_NAME_LEN] = (z == 1) ? &hdr->zone2_sample :
+                                      (z == 2) ? &hdr->zone3_sample :
+                                                  &hdr->zone4_sample;
+        if (zoff + 24 <= (int)payload_len) {
+            uint8_t n[12];
+            for (int i = 0; i < 12; i++) n[i] = read_nibble_byte(payload, &zoff);
+            akai_decode_name(n, 12, *dest);
+        }
+    }
+
+#undef NEED
+    return 0;
 }
 
 int s3k_fetch_sample_header(S3kClient *c, int sample_num, S3kSampleHeader *hdr) {

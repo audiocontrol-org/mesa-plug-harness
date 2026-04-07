@@ -38,7 +38,10 @@ static void usage(const char *prog) {
         "  list-samples         List resident sample names\n"
         "  list-programs        List resident program names\n"
         "  sample-header N      Show sample header for sample N\n"
+        "  program-header N     Show program header for program N\n"
+        "  keygroup P K         Show keygroup K of program P\n"
         "  download-sample N [file.wav]  Download sample N as WAV\n"
+        "  status               Show device overview\n"
         "  raw OPCODE [DATA...] Send raw Akai SysEx\n",
         prog);
 }
@@ -118,6 +121,52 @@ static int cmd_sample_header(S3kClient *c, int sample_num) {
     return 0;
 }
 
+static int cmd_program_header(S3kClient *c, int program_num) {
+    S3kProgramHeader hdr;
+    int status = s3k_fetch_program_header(c, program_num, &hdr);
+    if (status != 0) {
+        fprintf(stderr, "Failed to fetch program header %d (error=%d)\n", program_num, status);
+        return 1;
+    }
+
+    printf("Program %d:\n", program_num);
+    printf("  Name:        %s\n", hdr.name);
+    printf("  MIDI Prog:   %d\n", hdr.midi_program);
+    if (hdr.midi_channel == 255)
+        printf("  MIDI Chan:   OMNI\n");
+    else
+        printf("  MIDI Chan:   %d\n", hdr.midi_channel + 1);
+    printf("  Keygroups:   %d\n", hdr.num_keygroups);
+    printf("  Polyphony:   %d\n", hdr.polyphony + 1);
+    printf("  Play range:  %s - %s\n", note_name(hdr.play_lo), note_name(hdr.play_hi));
+    printf("  Priority:    %s\n",
+        hdr.priority == 0 ? "low" : hdr.priority == 1 ? "normal" :
+        hdr.priority == 2 ? "high" : hdr.priority == 3 ? "hold" : "?");
+    printf("  Output:      %d\n", hdr.output);
+    printf("  Pan:         %d\n", hdr.pan);
+    printf("  Loudness:    %d\n", hdr.loudness);
+    return 0;
+}
+
+static int cmd_keygroup_header(S3kClient *c, int program_num, int kg_num) {
+    S3kKeygroupHeader hdr;
+    int status = s3k_fetch_keygroup_header(c, program_num, kg_num, &hdr);
+    if (status != 0) {
+        fprintf(stderr, "Failed to fetch keygroup %d:%d (error=%d)\n", program_num, kg_num, status);
+        return 1;
+    }
+
+    printf("Keygroup %d:%d\n", program_num, kg_num);
+    printf("  Key range:   %s - %s\n", note_name(hdr.lo_note), note_name(hdr.hi_note));
+    printf("  Filter freq: %d\n", hdr.filter_freq);
+    printf("  Zone 1:      %s (vel %d-%d)\n", hdr.zone1_sample[0] ? hdr.zone1_sample : "(empty)",
+        hdr.zone1_lo_vel, hdr.zone1_hi_vel);
+    if (hdr.zone2_sample[0]) printf("  Zone 2:      %s\n", hdr.zone2_sample);
+    if (hdr.zone3_sample[0]) printf("  Zone 3:      %s\n", hdr.zone3_sample);
+    if (hdr.zone4_sample[0]) printf("  Zone 4:      %s\n", hdr.zone4_sample);
+    return 0;
+}
+
 static int cmd_raw(S3kClient *c, int argc, char *argv[]) {
     if (argc < 1) { fprintf(stderr, "raw: need opcode\n"); return 1; }
 
@@ -184,6 +233,41 @@ int main(int argc, char *argv[]) {
     else if (strcmp(cmd, "list-programs") == 0) result = cmd_list(&client, "programs");
     else if (strcmp(cmd, "sample-header") == 0 && i < argc)
         result = cmd_sample_header(&client, atoi(argv[i]));
+    else if (strcmp(cmd, "program-header") == 0 && i < argc)
+        result = cmd_program_header(&client, atoi(argv[i]));
+    else if (strcmp(cmd, "keygroup") == 0 && i + 1 < argc) {
+        int p = atoi(argv[i++]);
+        result = cmd_keygroup_header(&client, p, atoi(argv[i]));
+    }
+    else if (strcmp(cmd, "status") == 0) {
+        /* Overview: list programs with their keygroups and samples */
+        char pnames[S3K_MAX_NAMES][S3K_NAME_LEN];
+        char snames[S3K_MAX_NAMES][S3K_NAME_LEN];
+        int pc = s3k_list_programs(&client, pnames, S3K_MAX_NAMES);
+        int sc = s3k_list_samples(&client, snames, S3K_MAX_NAMES);
+        printf("Programs (%d):\n", pc > 0 ? pc : 0);
+        for (int j = 0; j < pc; j++) {
+            S3kProgramHeader ph;
+            if (s3k_fetch_program_header(&client, j, &ph) == 0)
+                printf("  %d: %-12s  ch=%s kg=%d poly=%d range=%s-%s\n",
+                    j, ph.name,
+                    ph.midi_channel == 255 ? "OMNI" : "?",
+                    ph.num_keygroups, ph.polyphony + 1,
+                    note_name(ph.play_lo), note_name(ph.play_hi));
+            else
+                printf("  %d: %s\n", j, pnames[j]);
+        }
+        printf("\nSamples (%d):\n", sc > 0 ? sc : 0);
+        for (int j = 0; j < sc; j++) {
+            S3kSampleHeader sh;
+            if (s3k_fetch_sample_header(&client, j, &sh) == 0)
+                printf("  %d: %-12s  %uHz %u samples %s\n",
+                    j, sh.name, sh.sample_rate, sh.length,
+                    sh.play_type == 2 ? "oneshot" : "loop");
+            else
+                printf("  %d: %s\n", j, snames[j]);
+        }
+    }
     else if (strcmp(cmd, "download-sample") == 0 && i < argc) {
         int sn = atoi(argv[i++]);
         const char *outpath = (i < argc) ? argv[i] : nullptr;
