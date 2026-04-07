@@ -515,19 +515,29 @@ int s3k_write_wav(const char *path, const int16_t *samples, int num_samples,
 
 /* Send a write command and check for REPLY OK */
 static int s3k_write(S3kClient *c, AkaiOpcode op, const uint8_t *data, size_t data_len) {
+    s3k_drain(c);
+
+    auto msg = akai_build_sysex(c->channel, op, data, data_len);
+    scsi_midi_send(&c->midi, msg.data(), msg.size());
+
+    usleep(300000); /* Give device time to process */
+
+    /* Try to read REPLY — some writes respond, some don't */
     uint8_t rx[S3K_MAX_RESPONSE];
     size_t rx_len = sizeof(rx);
+    int recv = scsi_midi_receive(&c->midi, rx, &rx_len, 5); /* Short timeout */
 
-    int status = s3k_exchange(c, op, data, data_len, rx, &rx_len);
-    if (status != 0) return status;
-
-    /* Check for REPLY (0x16) response */
-    AkaiOpcode resp_op;
-    const uint8_t *payload;
-    size_t payload_len;
-    if (akai_parse_response(rx, rx_len, &resp_op, &payload, &payload_len)) {
-        if (resp_op == OP_REPLY && payload_len > 0 && payload[0] != 0)
-            return -(int)payload[0]; /* Error code */
+    if (recv == 0 && rx_len > 0) {
+        AkaiOpcode resp_op;
+        const uint8_t *payload;
+        size_t payload_len;
+        if (akai_parse_response(rx, rx_len, &resp_op, &payload, &payload_len)) {
+            if (resp_op == OP_REPLY && payload_len > 0 && payload[0] != 0) {
+                fprintf(stderr, "s3k_write: device REPLY error code %d for op 0x%02x\n",
+                    payload[0], op);
+                return -(int)payload[0];
+            }
+        }
     }
     return 0;
 }

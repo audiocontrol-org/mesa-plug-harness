@@ -21,9 +21,12 @@
  */
 #include "s3k_client.h"
 #include "scsi_bridge.h"
+#include "scsi_midi.h"
+#include "akai_sysex.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unistd.h>
 
 static void usage(const char *prog) {
     fprintf(stderr,
@@ -43,6 +46,7 @@ static void usage(const char *prog) {
         "  download-sample N [file.wav]  Download sample N as WAV\n"
         "  upload-sample N file.wav      Upload WAV to sample N\n"
         "  delete-sample N               Delete sample N\n"
+        "  clone-program SRC DST         Clone program SRC to slot DST\n"
         "  delete-program N              Delete program N\n"
         "  status                        Show device overview\n"
         "  raw OPCODE [DATA...]          Send raw Akai SysEx\n",
@@ -327,6 +331,68 @@ int main(int argc, char *argv[]) {
         printf("Deleting sample %d...\n", sn);
         result = s3k_delete_sample(&client, sn);
         printf("%s\n", result == 0 ? "OK" : "Failed");
+    }
+    else if (strcmp(cmd, "clone-program") == 0 && i + 1 < argc) {
+        int src = atoi(argv[i++]);
+        int dst = atoi(argv[i]);
+        printf("Cloning program %d → %d\n", src, dst);
+        /* Fetch raw SysEx for source program */
+        uint8_t raw[S3K_MAX_RESPONSE];
+        size_t raw_len = sizeof(raw);
+        int status2 = s3k_fetch_raw(&client, OP_RPDATA, src, raw, &raw_len);
+        if (status2 != 0 || raw_len < 8) {
+            fprintf(stderr, "Failed to fetch program %d (status=%d)\n", src, status2);
+            result = 1;
+        } else {
+            /* Patch program number nibbles in the payload.
+             * Payload starts at byte 5 (after F0 47 ch op 48).
+             * First 2 nibbles of payload = program number (lo, hi). */
+            uint8_t dst_nib[2];
+            byte_to_nibbles(dst & 0xFF, dst_nib);
+            raw[5] = dst_nib[0];
+            raw[6] = dst_nib[1];
+            /* Send as PDATA (write) — strip SysEx envelope */
+            result = s3k_write_program_header(&client, dst, raw, raw_len);
+            printf("  PDATA write: %s\n", result == 0 ? "OK" : "FAILED");
+
+            if (result == 0) {
+                /* Also clone keygroup 0 from source to dest */
+                printf("  Cloning keygroup 0...\n");
+                uint8_t kg_raw[S3K_MAX_RESPONSE];
+                size_t kg_len = sizeof(kg_raw);
+                /* Fetch keygroup: RKDATA needs program nibbles + kg number */
+                usleep(300000);
+                /* Use raw command path — build and send RKDATA request manually */
+                uint8_t kg_req[3];
+                byte_to_nibbles(src & 0xFF, kg_req);
+                kg_req[2] = 0; /* keygroup 0 */
+                auto kg_sysex = akai_build_sysex(client.channel, OP_RKDATA, kg_req, 3);
+                scsi_midi_send(&client.midi, kg_sysex.data(), kg_sysex.size());
+                usleep(200000);
+                int kst = scsi_midi_receive(&client.midi, kg_raw, &kg_len, 30);
+                printf("  RKDATA fetch: status=%d len=%zu first: %02x %02x %02x %02x\n",
+                    kst, kg_len, kg_raw[0], kg_len>1?kg_raw[1]:0,
+                    kg_len>2?kg_raw[2]:0, kg_len>3?kg_raw[3]:0);
+                if (kst == 0 && kg_len > 7) {
+                    /* Patch program number in the keygroup response */
+                    uint8_t dst_nib2[2];
+                    byte_to_nibbles(dst & 0xFF, dst_nib2);
+                    kg_raw[5] = dst_nib2[0];
+                    kg_raw[6] = dst_nib2[1];
+                    /* Send as KDATA */
+                    int kwst = s3k_write_keygroup_header(&client, dst, 0, kg_raw, kg_len);
+                    printf("  KDATA write: %s (status=%d)\n", kwst == 0 ? "OK" : "FAILED", kwst);
+                } else {
+                    printf("  Failed to fetch source keygroup (status=%d)\n", kst);
+                }
+
+                usleep(500000);
+                printf("  Verifying:\n");
+                cmd_list(&client, "programs");
+            } else {
+                fprintf(stderr, "Write failed (status=%d)\n", result);
+            }
+        }
     }
     else if (strcmp(cmd, "delete-program") == 0 && i < argc) {
         int pn = atoi(argv[i]);
